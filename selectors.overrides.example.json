@@ -1,0 +1,21 @@
+{
+  "deepseek": {
+    "inputSelectors": [
+      "textarea",
+      "div[contenteditable=\"true\"][role=\"textbox\"]"
+    ],
+    "sendButtonSelectors": [
+      "button[type=\"submit\"]",
+      "button[aria-label*=\"发送\"]",
+      "button[aria-label*=\"Send\"]"
+    ],
+    "responseSelectors": [
+      ".ds-markdown",
+      "[class*=\"assistant\"]"
+    ],
+    "busySelectors": [
+      "button[aria-label*=\"停止\"]",
+      "button[aria-label*=\"Stop\"]"
+    ]
+  }
+}
