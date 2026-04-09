@@ -1700,7 +1700,7 @@ export class ProviderClient {
 
     while (true) {
       const now = Date.now();
-      if (now - startedAt >= maxTotalMs) break;      // 硬上限
+      if (now - startedAt >= maxTotalMs) break; // 硬上限
       if (now - lastActivityAt >= idleTimeoutMs) break; // 空闲超时
 
       const resolvedTargetSelector = await this.resolveUpdatedResponseSelector(
@@ -1716,7 +1716,7 @@ export class ProviderClient {
       // 将 isBusy 提到外层，以便无响应内容时也能检测到活跃状态
       const busy = await this.isBusy(page, provider);
 
-      let meaningfulTexts: string[] = [];
+      let meaningfulTexts: string[];
       if (targetSelector) {
         const previousSelectorCount = previousCountsBySelector?.[targetSelector] ?? previousCount;
         const texts = await this.collectNewResponseTexts(
