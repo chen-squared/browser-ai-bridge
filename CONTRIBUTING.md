@@ -71,7 +71,7 @@ npm run format:check
 
 ## 提交 Bug 报告
 
-请在 [Issues](https://github.com/yourusername/browser-ai-bridge/issues) 中提交，并包含：
+请在 [Issues](https://github.com/chen-squared/browser-ai-bridge/issues) 中提交，并包含：
 
 - Node.js 版本及操作系统
 - 受影响的 Provider 及浏览器版本

@@ -1,6 +1,6 @@
 # browser-ai-bridge
 
-[![CI](https://github.com/yourusername/browser-ai-bridge/actions/workflows/ci.yml/badge.svg)](https://github.com/yourusername/browser-ai-bridge/actions)
+[![CI](https://github.com/chen-squared/browser-ai-bridge/actions/workflows/ci.yml/badge.svg)](https://github.com/chen-squared/browser-ai-bridge/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Node.js 20+](https://img.shields.io/badge/node-20+-green.svg)](https://nodejs.org/)
 
