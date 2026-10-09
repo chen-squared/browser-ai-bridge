@@ -19,6 +19,14 @@ export type CompletionPayload = {
     participants?: ProviderId[];
     rounds?: number;
     summarizer?: ProviderId;
+    /**
+     * 总结者复用哪个席位的会话。席位名形如 deepseek1 / deepseek2。
+     *
+     * 不填则开新会话（`<provider>-summary`）。填了就沿用该席位的名字，
+     * 于是 conversationId 相同、命中同一个网页标签页——总结者能在自己
+     * 上一轮发言的基础上继续收口。
+     */
+    summarizerSeat?: string;
   };
 };
 
@@ -165,23 +173,40 @@ export function resolveMeetingPlan(
   const summarizerProvider = payload.meeting?.summarizer ?? template.summarizer.provider;
 
   const personaPool = template.participants;
-  const participants = (
+  const participantProviders =
     overrideParticipants && overrideParticipants.length > 0
       ? overrideParticipants
-      : template.participants.map((item) => item.provider)
-  ).map((provider, index) => {
+      : template.participants.map((item) => item.provider);
+
+  // 席位名由 provider 派生，重复的 provider 用序号区分：deepseek1 / deepseek2。
+  //
+  // 原来是 member-1 / member-2，看着只是序号，既看不出背后是哪个模型，
+  // 也没法在总结阶段指认"复用哪一个席位"。而席位名会进 conversationId
+  // （`<meetingId>:<alias>`），所以它同时是**会话身份**：同名即同一会话。
+  const seatCounters = new Map<ProviderId, number>();
+  const participants = participantProviders.map((provider, index) => {
     const base = personaPool[index % personaPool.length];
+    const nth = (seatCounters.get(provider) ?? 0) + 1;
+    seatCounters.set(provider, nth);
     return {
-      alias: `member-${index + 1}`,
+      alias: `${provider}${nth}`,
       provider,
       brief: base.brief,
       enableSearch: base.enableSearch,
       enableReasoning: base.enableReasoning,
     } satisfies MeetingParticipantPlan;
   });
-  const embeddedSummarizer = participants.find(
-    (participant) => participant.provider === summarizerProvider,
-  );
+
+  // 总结者：默认开新会话（summarizer-<provider>）；若显式指定复用某个席位，
+  // 就沿用那个席位的名字，从而复用同一个网页会话。
+  //
+  // 名字相同 ⇒ conversationId 相同 ⇒ browser-manager 命中已有标签页，
+  // 于是总结者是在该成员自己的会话里接着说，能看到它之前那一轮发言。
+  const requestedSeat = payload.meeting?.summarizerSeat;
+  const reusable = requestedSeat
+    ? participants.find((participant) => participant.alias === requestedSeat)
+    : undefined;
+  const summarizerAlias = reusable ? reusable.alias : `${summarizerProvider}-summary`;
 
   return {
     ...template,
@@ -189,7 +214,7 @@ export function resolveMeetingPlan(
     participants,
     summarizer: {
       ...template.summarizer,
-      alias: embeddedSummarizer?.alias ?? template.summarizer.alias,
+      alias: summarizerAlias,
       provider: summarizerProvider,
     },
   };
@@ -214,37 +239,30 @@ export function buildMeetingRoster(plan: MeetingTemplate): string {
 }
 
 function buildMeetingPolicy(plan: MeetingTemplate): MeetingPolicy {
-  const summarizerUsesParticipantSlot = plan.participants.some(
-    (participant) =>
-      participant.alias === plan.summarizer.alias &&
-      participant.provider === plan.summarizer.provider,
+  // 席位名与总结者名字相同 ⇒ 总结者复用了该成员的网页会话。
+  const reusesSeat = plan.participants.some(
+    (participant) => participant.alias === plan.summarizer.alias,
   );
   const discussionParticipants = plan.participants.map((participant) => participant.alias);
   const discussionParticipantsByRound = Array.from(
-    { length: plan.rounds },
-    (_unused, roundIndex) => {
-      if (!summarizerUsesParticipantSlot || roundIndex > 0) {
-        return discussionParticipants;
-      }
-
-      return discussionParticipants.filter((alias) => alias !== plan.summarizer.alias);
-    },
+    { length: Math.max(plan.rounds, 1) },
+    () => discussionParticipants,
   );
 
   return {
-    summarizerRole: summarizerUsesParticipantSlot ? 'participant-lead' : 'separate-lead',
+    summarizerRole: reusesSeat ? 'participant-lead' : 'separate-lead',
     summarizerSpeaksFirst: true,
     summarizerSpeaksLast: true,
     participantOrderControlsTurnOrder: true,
     duplicateProvidersAllowed: true,
     summarizerMayAlsoUseParticipantProvider: true,
-    summarizerUsesParticipantSlot,
+    summarizerUsesParticipantSlot: reusesSeat,
     coordinatorAlias: plan.summarizer.alias,
     discussionParticipants,
     discussionParticipantsByRound,
-    note: summarizerUsesParticipantSlot
-      ? '如果 summarizer provider 同时出现在 participants 里，则第一个匹配到的 member 会兼任统筹者：它固定先发言并最后总结；第 1 轮的个人分析已经并入 assignment，因此第 1 轮 discussion 从其他成员开始；从第 2 轮起统筹者重新加入讨论。participants 的顺序决定轮次顺序。重复 provider 仍会被视为不同 member 会话。'
-      : '如果 summarizer provider 没有出现在 participants 里，则会额外创建一个独立的统筹者会话：它固定先发言并最后总结；participants 的顺序决定 member-1/member-2... 的轮次顺序；重复 provider 会被视为不同 member 会话。',
+    note: reusesSeat
+      ? `总结者复用了席位 ${plan.summarizer.alias} 的会话，因此它既参加讨论、又负责最后收口，且能看到自己之前的发言。participants 的顺序就是发言顺序；重复 provider 用序号区分（deepseek1 / deepseek2），各占独立会话。`
+      : `总结者是独立会话（${plan.summarizer.alias}），不占参与者名额：participants 决定发言成员与顺序，每轮全部成员都发言。重复 provider 用序号区分（deepseek1 / deepseek2），各占独立会话。`,
   } as const;
 }
 
@@ -624,25 +642,6 @@ export function listMeetingModels() {
     description: template.description,
     kind: 'meeting',
   }));
-}
-
-export function buildMeetingOptionsHtml() {
-  return Object.values(meetingModelTemplates)
-    .map((template) => `<option value="${template.id}">${template.label}</option>`)
-    .join('');
-}
-
-export function buildMeetingHintMapScript() {
-  return JSON.stringify(
-    Object.fromEntries(
-      Object.values(meetingModelTemplates).map((template) => [
-        template.id,
-        template.mode === 'round-robin'
-          ? '轮流推进模板：统筹者先拆题并先做自己的部分，其余成员按顺序补充，最后由统筹者收束。'
-          : '并行推进模板：统筹者先拆题并先做自己的部分，其余成员并行补充，最后由统筹者统一汇总。',
-      ]),
-    ),
-  );
 }
 
 export function buildMeetingDetailsText(payload: unknown, reasoningText: string): string {
