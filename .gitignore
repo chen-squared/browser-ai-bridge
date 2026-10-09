@@ -3,6 +3,10 @@ dist
 .env
 .sessions
 
+# 本地 selector / provider 覆盖，是调试用的机器本地状态，不该提交。
+# 模板见 README 的「热重载」一节，需要时手动创建。
+selectors.overrides.json
+
 # macOS
 .DS_Store
 .AppleDouble

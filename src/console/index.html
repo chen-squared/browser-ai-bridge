@@ -1,0 +1,2037 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>browser-ai-bridge</title>
+    <style>
+      /* ── 设计基调 ──────────────────────────────────────────────
+         深色为主、留白克制、等宽字体只用在技术标识上。
+         配色刻意压低饱和度，正文对比度按 WCAG AA 以上配，
+         避免深色背景下常见的"灰得看不清"。
+      ───────────────────────────────────────────────────────── */
+      :root {
+        color-scheme: dark;
+        --bg: #0d1117;
+        --bg-soft: #131a23;
+        --panel: #161d27;
+        --panel-hi: #1c2531;
+        --ink: #e6edf3;
+        --ink-dim: #9aa7b4;
+        --ink-faint: #6b7887;
+        --line: #262f3d;
+        --line-hi: #354154;
+        --accent: #4a9eff;
+        --accent-dim: #1f6feb;
+        --ok: #3fb950;
+        --warn: #d29922;
+        --danger: #f85149;
+        --radius: 10px;
+        --radius-sm: 6px;
+        --mono: ui-monospace, 'SF Mono', 'JetBrains Mono', Menlo, Consolas, monospace;
+        --sans:
+          -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB',
+          'Microsoft YaHei', sans-serif;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      html,
+      body {
+        height: 100%;
+      }
+
+      body {
+        margin: 0;
+        font-family: var(--sans);
+        font-size: 14px;
+        line-height: 1.6;
+        background: var(--bg);
+        color: var(--ink);
+        -webkit-font-smoothing: antialiased;
+      }
+
+      /* ── 顶栏 ───────────────────────────────────────────────── */
+      .topbar {
+        position: sticky;
+        top: 0;
+        z-index: 20;
+        display: flex;
+        align-items: center;
+        gap: 16px;
+        height: 52px;
+        padding: 0 20px;
+        background: rgba(13, 17, 23, 0.85);
+        backdrop-filter: blur(12px);
+        border-bottom: 1px solid var(--line);
+      }
+
+      .brand {
+        display: flex;
+        align-items: center;
+        gap: 9px;
+        font-weight: 600;
+        letter-spacing: -0.01em;
+        white-space: nowrap;
+      }
+
+      .brand-mark {
+        width: 18px;
+        height: 18px;
+        border-radius: 5px;
+        background: linear-gradient(135deg, var(--accent), var(--accent-dim));
+      }
+
+      .topbar-spacer {
+        flex: 1;
+      }
+
+      /* 标签页：多模型并排对比的主导航 */
+      .tabs {
+        display: flex;
+        gap: 2px;
+        height: 100%;
+      }
+
+      .tab {
+        display: flex;
+        align-items: center;
+        padding: 0 14px;
+        border: none;
+        border-bottom: 2px solid transparent;
+        background: none;
+        color: var(--ink-dim);
+        font: inherit;
+        font-size: 13px;
+        cursor: pointer;
+        transition:
+          color 0.12s,
+          border-color 0.12s;
+      }
+
+      .tab:hover {
+        color: var(--ink);
+      }
+
+      .tab[aria-selected='true'] {
+        color: var(--ink);
+        border-bottom-color: var(--accent);
+      }
+
+      .health {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        padding: 4px 10px;
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        background: var(--bg-soft);
+        color: var(--ink-dim);
+        font-size: 12px;
+        white-space: nowrap;
+      }
+
+      .dot {
+        width: 6px;
+        height: 6px;
+        border-radius: 50%;
+        background: var(--ink-faint);
+      }
+
+      .health[data-state='ok'] .dot {
+        background: var(--ok);
+        box-shadow: 0 0 6px var(--ok);
+      }
+
+      .health[data-state='bad'] .dot {
+        background: var(--danger);
+      }
+
+      /* ── 布局 ───────────────────────────────────────────────── */
+      .shell {
+        max-width: 1440px;
+        margin: 0 auto;
+        padding: 20px;
+      }
+
+      .view[hidden] {
+        display: none;
+      }
+
+      .card {
+        border: 1px solid var(--line);
+        border-radius: var(--radius);
+        background: var(--panel);
+      }
+
+      .card-head {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 12px 14px;
+        border-bottom: 1px solid var(--line);
+      }
+
+      .card-title {
+        font-size: 13px;
+        font-weight: 600;
+        letter-spacing: 0.02em;
+      }
+
+      .card-body {
+        padding: 14px;
+      }
+
+      /* ── 模型选择：核心改进点 ───────────────────────────────
+         旧版是一个 <select> 只能选一个 provider，想比对就得来回切换、
+         反复手抄 conversationId。现在改成可多选的门牌，
+         并排成一列，一眼看清选了谁。
+      ───────────────────────────────────────────────────────── */
+      .model-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(148px, 1fr));
+        gap: 8px;
+      }
+
+      .model-tile {
+        display: flex;
+        align-items: center;
+        gap: 9px;
+        padding: 10px 12px;
+        border: 1px solid var(--line);
+        border-radius: var(--radius-sm);
+        background: var(--bg-soft);
+        cursor: pointer;
+        transition:
+          border-color 0.12s,
+          background 0.12s;
+      }
+
+      .model-tile:hover {
+        border-color: var(--line-hi);
+      }
+
+      .model-tile[data-on='true'] {
+        border-color: var(--accent-dim);
+        background: rgba(31, 111, 235, 0.1);
+      }
+
+      .model-tile input {
+        accent-color: var(--accent);
+        margin: 0;
+      }
+
+      .model-name {
+        font-weight: 500;
+      }
+
+      /* 真流捕获的标记：一眼看出这个 provider 的答案有多可信 */
+      .model-tag {
+        margin-left: auto;
+        padding: 1px 6px;
+        border-radius: 4px;
+        background: var(--panel-hi);
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 10px;
+      }
+
+      .model-tag[data-kind='stream'] {
+        background: rgba(63, 185, 80, 0.14);
+        color: var(--ok);
+      }
+
+      /* ── 表单 ───────────────────────────────────────────────── */
+      .field {
+        display: block;
+        margin-bottom: 12px;
+      }
+
+      .field-label {
+        display: block;
+        margin-bottom: 5px;
+        color: var(--ink-dim);
+        font-size: 12px;
+      }
+
+      input[type='text'],
+      input[type='number'],
+      textarea,
+      select {
+        width: 100%;
+        padding: 8px 10px;
+        border: 1px solid var(--line);
+        border-radius: var(--radius-sm);
+        background: var(--bg);
+        color: var(--ink);
+        font: inherit;
+        font-size: 13px;
+      }
+
+      input:focus,
+      textarea:focus,
+      select:focus {
+        border-color: var(--accent-dim);
+        outline: none;
+        box-shadow: 0 0 0 3px rgba(31, 111, 235, 0.15);
+      }
+
+      textarea {
+        min-height: 88px;
+        resize: vertical;
+        font-family: var(--mono);
+        font-size: 13px;
+        line-height: 1.65;
+      }
+
+      .row {
+        display: grid;
+        gap: 10px;
+        grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+      }
+
+      .check {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        color: var(--ink-dim);
+        font-size: 13px;
+        cursor: pointer;
+      }
+
+      .check input {
+        accent-color: var(--accent);
+      }
+
+      /* ── 按钮 ───────────────────────────────────────────────── */
+      button {
+        padding: 8px 14px;
+        border: 1px solid var(--line-hi);
+        border-radius: var(--radius-sm);
+        background: var(--panel-hi);
+        color: var(--ink);
+        font: inherit;
+        font-size: 13px;
+        cursor: pointer;
+        transition:
+          background 0.12s,
+          border-color 0.12s;
+      }
+
+      button:hover:not(:disabled) {
+        background: #232e3c;
+        border-color: #46536a;
+      }
+
+      button:disabled {
+        opacity: 0.45;
+        cursor: not-allowed;
+      }
+
+      button.primary {
+        border-color: var(--accent-dim);
+        background: var(--accent-dim);
+        color: #fff;
+      }
+
+      button.primary:hover:not(:disabled) {
+        background: #2b7cf0;
+      }
+
+      button.ghost {
+        border-color: transparent;
+        background: none;
+        color: var(--ink-dim);
+      }
+
+      button.ghost:hover:not(:disabled) {
+        background: var(--panel-hi);
+        color: var(--ink);
+      }
+
+      button.danger {
+        border-color: transparent;
+        background: none;
+        color: var(--danger);
+      }
+
+      .btn-row {
+        display: flex;
+        gap: 8px;
+        flex-wrap: wrap;
+        align-items: center;
+      }
+
+      /* ── 对比区：并排的模型回答 ────────────────────────────── */
+      .compare-grid {
+        display: grid;
+        gap: 12px;
+        grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+        margin-top: 14px;
+      }
+
+      .answer {
+        display: flex;
+        flex-direction: column;
+        border: 1px solid var(--line);
+        border-radius: var(--radius);
+        background: var(--panel);
+        overflow: hidden;
+      }
+
+      .answer-head {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 9px 12px;
+        border-bottom: 1px solid var(--line);
+        background: var(--bg-soft);
+      }
+
+      .answer-name {
+        font-weight: 600;
+        font-size: 13px;
+      }
+
+      .answer-time {
+        margin-left: auto;
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 11px;
+      }
+
+      .answer-body {
+        flex: 1;
+        max-height: 460px;
+        overflow-y: auto;
+        padding: 12px;
+        font-size: 13.5px;
+        line-height: 1.7;
+        word-break: break-word;
+      }
+
+      .answer-body > :first-child {
+        margin-top: 0;
+      }
+
+      .answer-body > :last-child {
+        margin-bottom: 0;
+      }
+
+      .answer-body p {
+        margin: 0 0 10px;
+      }
+
+      .answer-body pre {
+        padding: 10px;
+        border-radius: var(--radius-sm);
+        background: var(--bg);
+        overflow-x: auto;
+        font-family: var(--mono);
+        font-size: 12px;
+      }
+
+      .answer-body code {
+        padding: 1px 5px;
+        border-radius: 4px;
+        background: var(--panel-hi);
+        font-family: var(--mono);
+        font-size: 12px;
+      }
+
+      .answer-body pre code {
+        padding: 0;
+        background: none;
+      }
+
+      .answer-body ul,
+      .answer-body ol {
+        margin: 0 0 10px;
+        padding-left: 20px;
+      }
+
+      .answer-body blockquote {
+        margin: 0 0 10px;
+        padding-left: 12px;
+        border-left: 2px solid var(--line-hi);
+        color: var(--ink-dim);
+      }
+
+      .answer-body table {
+        border-collapse: collapse;
+        margin-bottom: 10px;
+      }
+
+      .answer-body th,
+      .answer-body td {
+        padding: 5px 10px;
+        border: 1px solid var(--line);
+      }
+
+      .answer-body img {
+        max-width: 100%;
+      }
+
+      /* 思考折叠区 */
+      .thinking {
+        margin: 0;
+        border-bottom: 1px solid var(--line);
+      }
+
+      .thinking summary {
+        padding: 7px 12px;
+        color: var(--ink-dim);
+        font-size: 12px;
+        cursor: pointer;
+        user-select: none;
+      }
+
+      .thinking summary:hover {
+        color: var(--ink);
+      }
+
+      .thinking-body {
+        max-height: 180px;
+        overflow-y: auto;
+        padding: 4px 12px 10px;
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 12px;
+        line-height: 1.65;
+        white-space: pre-wrap;
+      }
+
+      /* 状态行 */
+      .status {
+        padding: 8px 11px;
+        border: 1px solid var(--line);
+        border-left: 2px solid var(--ink-faint);
+        border-radius: var(--radius-sm);
+        background: var(--bg-soft);
+        color: var(--ink-dim);
+        font-size: 12.5px;
+      }
+
+      .status[data-tone='ok'] {
+        border-left-color: var(--ok);
+      }
+
+      .status[data-tone='warn'] {
+        border-left-color: var(--warn);
+      }
+
+      .status[data-tone='err'] {
+        border-left-color: var(--danger);
+        color: #ffb4ae;
+      }
+
+      .status[data-tone='busy'] {
+        border-left-color: var(--accent);
+      }
+
+      .status[data-tone='busy']::before {
+        content: '';
+        display: inline-block;
+        width: 7px;
+        height: 7px;
+        margin-right: 7px;
+        border-radius: 50%;
+        background: var(--accent);
+        animation: pulse 1s ease-in-out infinite;
+        vertical-align: middle;
+      }
+
+      @keyframes pulse {
+        0%,
+        100% {
+          opacity: 0.25;
+        }
+        50% {
+          opacity: 1;
+        }
+      }
+
+      /* 光标：流式输出时的视觉反馈 */
+      .caret::after {
+        content: '▌';
+        color: var(--accent);
+        animation: blink 1s steps(2) infinite;
+      }
+
+      @keyframes blink {
+        50% {
+          opacity: 0;
+        }
+      }
+
+      /* ── 调试输出 ───────────────────────────────────────────── */
+      pre.dump {
+        max-height: 300px;
+        margin: 0;
+        overflow: auto;
+        padding: 11px;
+        border: 1px solid var(--line);
+        border-radius: var(--radius-sm);
+        background: var(--bg);
+        color: var(--ink-dim);
+        font-family: var(--mono);
+        font-size: 12px;
+        line-height: 1.6;
+        white-space: pre-wrap;
+        word-break: break-all;
+      }
+
+      .mono {
+        font-family: var(--mono);
+        font-size: 12px;
+      }
+
+      .muted {
+        color: var(--ink-dim);
+      }
+
+      .faint {
+        color: var(--ink-faint);
+        font-size: 12px;
+      }
+
+      .stack > * + * {
+        margin-top: 12px;
+      }
+
+      .split {
+        display: grid;
+        gap: 12px;
+        grid-template-columns: 300px 1fr;
+        align-items: start;
+      }
+
+      .chat-scroll {
+        max-height: 380px;
+        overflow-y: auto;
+        padding-right: 4px;
+      }
+
+      .bubble-row {
+        display: flex;
+        gap: 9px;
+        margin-bottom: 12px;
+      }
+
+      .bubble {
+        max-width: 82%;
+        padding: 9px 12px;
+        border: 1px solid var(--line);
+        border-radius: var(--radius);
+        background: var(--bg-soft);
+        font-size: 13.5px;
+        line-height: 1.7;
+      }
+
+      .bubble-row.user {
+        justify-content: flex-end;
+      }
+
+      .bubble-row.user .bubble {
+        border-color: var(--accent-dim);
+        background: rgba(31, 111, 235, 0.12);
+      }
+
+      .bubble-meta {
+        margin-bottom: 4px;
+        color: var(--ink-faint);
+        font-size: 11px;
+      }
+
+      .meeting-bubble-stack {
+        display: flex;
+        flex-direction: column;
+        gap: 7px;
+      }
+
+      .empty {
+        padding: 26px 14px;
+        border: 1px dashed var(--line-hi);
+        border-radius: var(--radius);
+        color: var(--ink-faint);
+        text-align: center;
+        font-size: 13px;
+      }
+
+      /* 参与者席位列表：发言顺序在这里定，所以必须有显式的排序控件。
+     席位名（deepseek1 / deepseek2）同时是会话身份，一眼要能对上。 */
+      .seat-list {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+      }
+
+      .seat {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 7px 8px 7px 10px;
+        border: 1px solid var(--line);
+        border-radius: var(--radius-sm);
+        background: var(--bg-soft);
+      }
+
+      .seat-index {
+        width: 20px;
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 11px;
+        text-align: right;
+      }
+
+      .seat select {
+        flex: 1;
+        padding: 5px 8px;
+        font-size: 12.5px;
+      }
+
+      .seat-name {
+        min-width: 84px;
+        color: var(--ink-dim);
+        font-family: var(--mono);
+        font-size: 11px;
+      }
+
+      .seat-btns {
+        display: flex;
+        gap: 2px;
+      }
+
+      .seat-btns button {
+        padding: 3px 7px;
+        font-size: 12px;
+        line-height: 1.2;
+      }
+
+      .seat[data-summary='true'] {
+        border-color: var(--accent-dim);
+        background: rgba(31, 111, 235, 0.1);
+      }
+
+      .seat-badge {
+        padding: 1px 6px;
+        border-radius: 4px;
+        background: var(--accent-dim);
+        color: #fff;
+        font-size: 10px;
+        white-space: nowrap;
+      }
+
+      /* 编排方式切换：两种模式的差别是根本性的，值得给足视觉权重 */
+      .mode-picker {
+        display: grid;
+        gap: 8px;
+        grid-template-columns: 1fr 1fr;
+      }
+
+      .mode {
+        display: flex;
+        flex-direction: column;
+        gap: 3px;
+        padding: 11px 12px;
+        text-align: left;
+      }
+
+      .mode[aria-pressed='true'] {
+        border-color: var(--accent-dim);
+        background: rgba(31, 111, 235, 0.12);
+      }
+
+      .mode-name {
+        font-weight: 600;
+        font-size: 13.5px;
+      }
+
+      .mode-desc {
+        color: var(--ink-dim);
+        font-size: 11.5px;
+        line-height: 1.45;
+      }
+
+      @media (max-width: 880px) {
+        .split {
+          grid-template-columns: 1fr;
+        }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        .status[data-tone='busy']::before,
+        .caret::after {
+          animation: none;
+        }
+      }
+    </style>
+    <script src="/vendor/marked/marked.umd.js"></script>
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand"><span class="brand-mark"></span>browser-ai-bridge</div>
+      <nav class="tabs" role="tablist">
+        <button class="tab" role="tab" data-view="playground" aria-selected="true">并排对比</button>
+        <button class="tab" role="tab" data-view="meeting" aria-selected="false">多模型会议</button>
+        <button class="tab" role="tab" data-view="sessions" aria-selected="false">会话管理</button>
+        <button class="tab" role="tab" data-view="debug" aria-selected="false">诊断</button>
+      </nav>
+      <div class="topbar-spacer"></div>
+      <span class="health" id="healthBadge"
+        ><span class="dot"></span><span id="healthText">连接中…</span></span
+      >
+    </header>
+
+    <div class="shell">
+      <!-- ══ 并排对比 ══════════════════════════════════════════ -->
+      <section class="view" id="view-playground">
+        <div class="split">
+          <div class="card">
+            <div class="card-head"><span class="card-title">提问</span></div>
+            <div class="card-body stack">
+              <div>
+                <span class="field-label">选择模型（可多选）</span>
+                <div class="model-grid" id="modelGrid"></div>
+                <p class="faint" style="margin: 7px 0 0">
+                  选中的模型会并行提问，答案并排显示。同一模型内部会自己排队，不会互相踩。
+                </p>
+              </div>
+
+              <label class="field">
+                <span class="field-label">问题</span>
+                <textarea id="prompt">用一句话解释 TCP 和 UDP 的区别。</textarea>
+              </label>
+
+              <label class="field">
+                <span class="field-label">
+                  conversationId
+                  <span class="faint">（留空=每次新会话；填写=接着上次聊）</span>
+                </span>
+                <input type="text" id="conversationId" placeholder="留空即新会话" />
+              </label>
+
+              <div class="row">
+                <label class="field">
+                  <span class="field-label">智能搜索</span>
+                  <select id="searchMode">
+                    <option value="auto">auto</option>
+                    <option value="on" selected>on</option>
+                    <option value="off">off</option>
+                  </select>
+                </label>
+                <label class="field">
+                  <span class="field-label">深度思考</span>
+                  <select id="reasoningMode">
+                    <option value="auto">auto</option>
+                    <option value="on" selected>on</option>
+                    <option value="off">off</option>
+                  </select>
+                </label>
+              </div>
+
+              <div class="btn-row">
+                <button class="primary" id="sendBtn">并行提问</button>
+                <button id="stopBtn" disabled>中断</button>
+                <button class="ghost" id="newChatBtn">清空会话号</button>
+              </div>
+
+              <div class="status" id="playStatus">选好模型、写下问题，然后点「并行提问」。</div>
+            </div>
+          </div>
+
+          <div>
+            <div class="card">
+              <div class="card-head">
+                <span class="card-title">回答</span>
+                <div class="topbar-spacer"></div>
+                <button class="ghost" id="copyAllBtn">复制全部</button>
+              </div>
+              <div class="card-body">
+                <div class="compare-grid" id="answerGrid"></div>
+                <div class="empty" id="answerEmpty">还没有回答。</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ══ 多模型会议 ════════════════════════════════════════ -->
+      <section class="view" id="view-meeting" hidden>
+        <div class="split">
+          <div class="card">
+            <div class="card-head"><span class="card-title">编排方式</span></div>
+            <div class="card-body stack">
+              <div class="mode-picker" id="modePicker">
+                <button class="mode" data-mode="round-robin" aria-pressed="true">
+                  <span class="mode-name">顺序对话</span>
+                  <span class="mode-desc">模型依次发言，后一个能看到前面的全部发言</span>
+                </button>
+                <button class="mode" data-mode="parallel" aria-pressed="false">
+                  <span class="mode-name">并行作答</span>
+                  <span class="mode-desc">各模型独立回答同一问题，互不可见，最后汇总</span>
+                </button>
+              </div>
+
+              <div>
+                <div class="field-label">参与者（顺序即发言顺序）</div>
+                <div class="seat-list" id="seatList"></div>
+                <div class="btn-row" style="margin-top: 8px">
+                  <button class="ghost" id="addSeatBtn">添加参与者</button>
+                  <button class="ghost" id="clearSeatsBtn">清空</button>
+                </div>
+                <p class="faint" style="margin: 7px 0 0" id="rosterHint"></p>
+              </div>
+
+              <label class="field">
+                <span class="field-label">总结者</span>
+                <select id="meetingSummarizer"></select>
+              </label>
+
+              <label class="field">
+                <span class="field-label">总结时使用哪个会话</span>
+                <select id="summarizerSeat"></select>
+                <p class="faint" style="margin: 5px 0 0" id="seatHint"></p>
+              </label>
+              <label class="field">
+                <span class="field-label">发言轮数</span>
+                <input type="number" id="meetingRounds" min="1" max="4" value="1" />
+              </label>
+              <label class="field">
+                <span class="field-label">会议 conversationId</span>
+                <input
+                  type="text"
+                  id="meetingConversationId"
+                  placeholder="留空时首次发送自动生成，之后页面会复用"
+                />
+              </label>
+              <div class="btn-row">
+                <button class="danger" id="clearMeetingBtn">清空会议会话</button>
+              </div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-head"><span class="card-title">会议</span></div>
+            <div class="card-body stack">
+              <p class="faint" id="meetingHint" style="margin: 0"></p>
+              <div class="chat-scroll" id="meetingChat"></div>
+              <label class="field" style="margin: 0">
+                <span class="field-label">你的消息</span>
+                <textarea
+                  id="meetingComposer"
+                  placeholder="输入一条普通用户消息，例如：请帮我比较这三个实现方向的取舍。"
+                ></textarea>
+              </label>
+              <div class="btn-row">
+                <button class="primary" id="meetingSendBtn">发送到会议</button>
+                <button class="ghost" id="meetingNewBtn">新一轮</button>
+              </div>
+              <div class="status" id="meetingStatus">还没有开始会议。</div>
+              <details>
+                <summary class="faint" style="cursor: pointer">
+                  会议详情（模板 / 参与者 / reasoning transcript）
+                </summary>
+                <pre class="dump" id="meetingDetails" style="margin-top: 8px">
+发送后这里会显示。</pre
+                >
+              </details>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ══ 会话管理 ══════════════════════════════════════════ -->
+      <section class="view" id="view-sessions" hidden>
+        <div class="split">
+          <div class="card">
+            <div class="card-head"><span class="card-title">标签页</span></div>
+            <div class="card-body stack">
+              <label class="field">
+                <span class="field-label">Provider</span>
+                <select id="sessionProvider"></select>
+              </label>
+              <div class="btn-row">
+                <button id="refreshStatusBtn">刷新</button>
+                <button class="ghost" id="openSessionBtn">打开页面</button>
+                <button class="ghost" id="inspectPageBtn">调试页面</button>
+                <button class="danger" id="clearSessionBtn">清理会话号</button>
+                <button class="ghost" id="reloadSelectorsBtn">重载 Selector</button>
+              </div>
+              <label class="check">
+                <input type="checkbox" id="revealOnRequest" />
+                操作时把标签页切到前台
+              </label>
+              <div class="status" id="sessionStatus">还没有加载状态。</div>
+            </div>
+          </div>
+
+          <div class="stack">
+            <div class="card">
+              <div class="card-head"><span class="card-title">当前会话</span></div>
+              <div class="card-body">
+                <pre class="dump" id="sessionList">
+点「刷新」查看内存中的会话与 conversationId。</pre
+                >
+              </div>
+            </div>
+            <div class="card">
+              <div class="card-head"><span class="card-title">Provider 配置</span></div>
+              <div class="card-body">
+                <pre class="dump" id="providerConfig">点「重载 Selector」后显示。</pre>
+              </div>
+            </div>
+            <div class="card">
+              <div class="card-head"><span class="card-title">页面探测</span></div>
+              <div class="card-body">
+                <pre class="dump" id="inspectDump">点「调试页面」后显示按钮、输入框与标题。</pre>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ══ 诊断 ══════════════════════════════════════════════ -->
+      <section class="view" id="view-debug" hidden>
+        <div class="card">
+          <div class="card-head">
+            <span class="card-title">Bridge token</span>
+            <div class="topbar-spacer"></div>
+            <span class="faint">设了 BRIDGE_TOKEN 才需要填</span>
+          </div>
+          <div class="card-body stack">
+            <label class="field" style="margin: 0">
+              <span class="field-label">x-bridge-token</span>
+              <input type="text" id="bridgeToken" placeholder="留空表示未启用访问控制" />
+            </label>
+            <div class="status">
+              出错时是否把标签页切到前台，由服务端的
+              <span class="mono">REVEAL_ON_ERROR</span> 决定（默认关闭）。
+              这里勾选只是方便手动打开页面。
+            </div>
+          </div>
+        </div>
+      </section>
+    </div>
+
+    <script>
+      /* ── 基础设施 ─────────────────────────────────────────── */
+      const $ = (id) => document.getElementById(id);
+
+      const PROVIDERS = ['chatgpt', 'claude', 'deepseek', 'grok', 'qwen', 'gemini'];
+
+      /** provider 的展示名。中文界面里英文 id 太难认。 */
+      const LABELS = {
+        chatgpt: 'ChatGPT',
+        claude: 'Claude',
+        deepseek: 'DeepSeek',
+        grok: 'Grok',
+        qwen: '通义千问',
+        gemini: 'Gemini',
+      };
+
+      /** 会话号存在 sessionStorage，刷新后接着聊。 */
+      function convKey(provider) {
+        return 'bridge.conv.' + provider;
+      }
+
+      function loadConv(provider) {
+        try {
+          return sessionStorage.getItem(convKey(provider)) || '';
+        } catch {
+          return '';
+        }
+      }
+
+      function saveConv(provider, value) {
+        try {
+          if (value) {
+            sessionStorage.setItem(convKey(provider), value);
+          } else {
+            sessionStorage.removeItem(convKey(provider));
+          }
+        } catch {
+          /* 隐私模式下 sessionStorage 可能不可用，忽略即可 */
+        }
+      }
+
+      function pretty(value) {
+        try {
+          return JSON.stringify(value, null, 2);
+        } catch {
+          return String(value);
+        }
+      }
+
+      function readBridgeToken() {
+        const params = new URLSearchParams(location.search);
+        const fromUrl = params.get('token');
+        if (fromUrl) {
+          try {
+            sessionStorage.setItem('bridge.token', fromUrl);
+          } catch {
+            /* 忽略 */
+          }
+          return fromUrl;
+        }
+        try {
+          return sessionStorage.getItem('bridge.token') || '';
+        } catch {
+          return '';
+        }
+      }
+
+      function withToken(headers) {
+        const token = readBridgeToken();
+        return token ? { ...(headers || {}), 'x-bridge-token': token } : headers || {};
+      }
+
+      async function api(url, options) {
+        const response = await fetch(url, {
+          ...(options || {}),
+          headers: withToken({ 'Content-Type': 'application/json', ...(options?.headers || {}) }),
+        });
+        const text = await response.text();
+        let payload = text;
+        try {
+          payload = JSON.parse(text);
+        } catch {
+          /* 不是 JSON 就按原文处理 */
+        }
+        if (!response.ok) {
+          const message =
+            (payload && payload.error && payload.error.message) ||
+            (typeof payload === 'string' ? payload : '') ||
+            'HTTP ' + response.status;
+          throw new Error(message);
+        }
+        return payload;
+      }
+
+      /* ── 流式读取 ──────────────────────────────────────────────
+         按 \n\n 切事件块。**必须按 code point 而不是 UTF-16 单元切**，
+         否则一个代理对（emoji、罕用汉字）会被劈成两半，
+         拼出来的文本里会出现替换字符。
+      ─────────────────────────────────────────────────────── */
+      async function readEventStream(url, payload, onDelta) {
+        const response = await fetch(url, {
+          method: 'POST',
+          headers: withToken({ 'Content-Type': 'application/json' }),
+          body: JSON.stringify(payload),
+        });
+
+        if (!response.ok) {
+          const raw = await response.text();
+          let message = raw;
+          try {
+            const parsed = JSON.parse(raw);
+            message = parsed?.error?.message || pretty(parsed);
+          } catch {
+            /* 保留原文 */
+          }
+          throw new Error(message);
+        }
+
+        if (!response.body) {
+          throw new Error('服务端没有返回可读取的流');
+        }
+
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+
+        for (;;) {
+          const chunk = await reader.read();
+          if (chunk.done) {
+            buffer += decoder.decode();
+          } else {
+            buffer += decoder.decode(chunk.value, { stream: true });
+          }
+
+          let cut = buffer.indexOf('\n\n');
+          while (cut !== -1) {
+            const raw = buffer.slice(0, cut);
+            buffer = buffer.slice(cut + 2);
+            const data = raw
+              .split('\n')
+              .filter((line) => line.startsWith('data:'))
+              .map((line) => line.slice(5).trim())
+              .join('\n');
+            if (data && data !== '[DONE]' && onDelta) {
+              try {
+                onDelta(JSON.parse(data));
+              } catch {
+                /* 半截 JSON 是正常的，丢掉 */
+              }
+            }
+            cut = buffer.indexOf('\n\n');
+          }
+
+          if (chunk.done) {
+            break;
+          }
+        }
+      }
+
+      /* ── 标签页切换 ─────────────────────────────────────────── */
+      for (const tab of document.querySelectorAll('.tab')) {
+        tab.addEventListener('click', () => {
+          for (const other of document.querySelectorAll('.tab')) {
+            other.setAttribute('aria-selected', String(other === tab));
+          }
+          for (const view of document.querySelectorAll('.view')) {
+            view.hidden = view.id !== 'view-' + tab.dataset.view;
+          }
+        });
+      }
+
+      /* ── 健康状态 ───────────────────────────────────────────── */
+      async function refreshHealth() {
+        const badge = $('healthBadge');
+        const text = $('healthText');
+        try {
+          const payload = await api('/health');
+          badge.dataset.state = payload.ok ? 'ok' : 'bad';
+          text.textContent = payload.headless ? '运行中（无头）' : '运行中';
+        } catch (error) {
+          badge.dataset.state = 'bad';
+          text.textContent = '连不上';
+        }
+      }
+
+      /* ══ 并排对比 ══════════════════════════════════════════════
+         旧版只能选一个 provider，想比就得来回切、还得手抄会话号。
+         这里的做法：多选模型 → 并行发请求 → 答案并排显示，
+         每个答案各自记住自己的 conversationId。
+      ─────────────────────────────────────────────────────── */
+      const answers = new Map(); // provider -> { node, body, thinking, text, elapsed }
+      let inFlight = null; // AbortController
+
+      function renderModelGrid(streamKinds) {
+        const grid = $('modelGrid');
+        grid.innerHTML = '';
+        for (const id of PROVIDERS) {
+          const tile = document.createElement('label');
+          tile.className = 'model-tile';
+          tile.dataset.provider = id;
+          tile.dataset.on = String(!loadConv(id) && defaults.has(id));
+
+          const box = document.createElement('input');
+          box.type = 'checkbox';
+          box.checked = tile.dataset.on === 'true';
+          box.addEventListener('change', () => {
+            tile.dataset.on = String(box.checked);
+            defaults.set(id, box.checked);
+          });
+
+          const name = document.createElement('span');
+          name.className = 'model-name';
+          name.textContent = LABELS[id] || id;
+
+          tile.append(box, name);
+
+          // 标出这个 provider 的答案来源。这是选模型时最该知道的一件事：
+          // 真流=协议级数据，DOM=从页面文本推断。
+          const tag = document.createElement('span');
+          tag.className = 'model-tag';
+          const kind = streamKinds[id];
+          tag.dataset.kind = kind ? 'stream' : 'dom';
+          tag.textContent = kind ? '真流' : 'DOM';
+          tag.title = kind
+            ? '正文来自网页自己收到的协议数据，思考与回答由协议字段区分'
+            : '正文从页面文本推断，可能受页面排版影响';
+          tile.append(tag);
+
+          grid.append(tile);
+        }
+      }
+
+      /** 默认勾选哪几个：一半的选择负担由默认值承担。 */
+      const defaults = new Map();
+      function pickDefaults() {
+        for (const id of ['chatgpt', 'deepseek']) {
+          defaults.set(id, true);
+        }
+      }
+
+      /** 会议的默认参与者。比并排对比多一个，才看得出「多方发言」的差别。 */
+      const MEETING_DEFAULTS = ['chatgpt', 'claude', 'deepseek'];
+
+      /** boot 拿到的真流标记，事件回调里要用到（渲染函数没有参数传进来）。 */
+      let streamKindsCache = {};
+
+      function renderMeetingHint() {
+        $('meetingHint').textContent =
+          meetingState.mode === 'round-robin'
+            ? '席位依次发言，每个都能看到前面所有席位的发言和你的消息；结束后由总结者收口成一条答复。'
+            : '所有席位同时回答同一个问题，彼此看不到对方的答案；结束后由总结者汇总成一条答复。';
+      }
+
+      function selectedProviders() {
+        return [...document.querySelectorAll('.model-tile')]
+          .filter((tile) => tile.dataset.on === 'true')
+          .map((tile) => tile.dataset.provider);
+      }
+
+      function clearAnswers(message) {
+        answers.clear();
+        $('answerGrid').innerHTML = '';
+        $('answerEmpty').hidden = false;
+        $('answerEmpty').textContent = message;
+      }
+
+      function ensureCard(id) {
+        const card = document.createElement('article');
+        card.className = 'answer';
+        card.dataset.provider = id;
+
+        const head = document.createElement('div');
+        head.className = 'answer-head';
+        const name = document.createElement('span');
+        name.className = 'answer-name';
+        name.textContent = LABELS[id] || id;
+        const time = document.createElement('span');
+        time.className = 'answer-time';
+        head.append(name, time);
+
+        const entry = { node: card, body: null, thinking: null, time, text: '' };
+        const thinking = document.createElement('details');
+        thinking.className = 'thinking';
+        thinking.hidden = true;
+        const summary = document.createElement('summary');
+        summary.textContent = '思考过程';
+        const thinkingBody = document.createElement('div');
+        thinkingBody.className = 'thinking-body';
+        thinking.append(summary, thinkingBody);
+
+        const body = document.createElement('div');
+        body.className = 'answer-body';
+        body.innerHTML = '<p class="muted">等待回答…</p>';
+
+        card.append(head, thinking, body);
+        $('answerEmpty').hidden = true;
+        $('answerGrid').append(card);
+        entry.thinking = thinking;
+        entry.thinkingBody = thinkingBody;
+        entry.body = body;
+        answers.set(id, entry);
+        return entry;
+      }
+
+      function setStatus(node, tone, message) {
+        node.dataset.tone = tone;
+        node.textContent = message;
+      }
+
+      async function sendAll() {
+        if (inFlight) {
+          return;
+        }
+        const picked = selectedProviders();
+        if (picked.length === 0) {
+          setStatus($('playStatus'), 'warn', '先在上面勾选至少一个模型。');
+          return;
+        }
+
+        const prompt = $('prompt').value.trim();
+        if (!prompt) {
+          setStatus($('playStatus'), 'warn', '问题是空的。');
+          return;
+        }
+
+        // 会话号按 provider 分别记：多模型共用一个会话号是没有意义的。
+        const shared = $('conversationId').value.trim();
+        for (const id of picked) {
+          saveConv(id, shared);
+        }
+
+        clearAnswers('正在提问…');
+        setStatus($('playStatus'), 'busy', `向 ${picked.length} 个模型提问中…`);
+
+        const controller = new AbortController();
+        inFlight = controller;
+        $('sendBtn').disabled = true;
+        $('stopBtn').disabled = false;
+
+        const started = Date.now();
+        const jobs = picked.map(async (id) => {
+          const entry = ensureCard(id);
+          const t0 = Date.now();
+          try {
+            await runOne(id, entry, controller.signal);
+            const seconds = ((Date.now() - t0) / 1000).toFixed(1);
+            entry.time.textContent = seconds + 's';
+          } catch (error) {
+            entry.time.textContent = '—';
+            if (error?.name === 'AbortError') {
+              entry.body.innerHTML = '<p class="faint">已中断。</p>';
+            } else {
+              entry.body.innerHTML = '';
+              const box = document.createElement('div');
+              box.className = 'status';
+              box.dataset.tone = 'err';
+              box.textContent = String(error?.message || error);
+              entry.body.append(box);
+            }
+          }
+        });
+
+        await Promise.all(jobs);
+
+        inFlight = null;
+        $('sendBtn').disabled = false;
+        $('stopBtn').disabled = true;
+
+        if (controller.signal.aborted) {
+          setStatus($('playStatus'), 'warn', '已中断。');
+          return;
+        }
+
+        const failed = picked.filter((id) => {
+          const body = answers.get(id)?.body;
+          return body && body.querySelector('.status[data-tone="err"]');
+        });
+        const total = ((Date.now() - started) / 1000).toFixed(1);
+        setStatus(
+          $('playStatus'),
+          failed.length ? 'warn' : 'ok',
+          failed.length
+            ? `完成，用时 ${total}s；${failed.map((f) => LABELS[f] || f).join('、')} 失败。`
+            : `全部完成，用时 ${total}s。`,
+        );
+      }
+
+      async function runOne(id, entry, signal) {
+        const payload = {
+          provider: id,
+          model: id + '-web',
+          messages: [{ role: 'user', content: $('prompt').value.trim() }],
+          stream: true,
+          enableSearch: $('searchMode').value === 'on' ? undefined : $('searchMode').value,
+          enableReasoning: $('reasoningMode').value === 'on' ? undefined : $('reasoningMode').value,
+        };
+        const existingConv = loadConv(id);
+        if (existingConv) {
+          payload.conversationId = existingConv;
+        }
+
+        let text = '';
+        let thinking = '';
+        let conv = null;
+
+        await readEventStream('/v1/chat/completions', payload, (chunk) => {
+          const delta = chunk?.choices?.[0]?.delta || {};
+          if (delta.reasoning_content) {
+            thinking += delta.reasoning_content;
+            entry.thinking.hidden = false;
+            entry.thinkingBody.textContent = thinking;
+          }
+          if (typeof delta.content === 'string' && delta.content) {
+            text += delta.content;
+            // 流式阶段先显示纯文本，等最后拿到完整结果再用 marked 渲染。
+            entry.body.classList.add('caret');
+            entry.body.textContent = text;
+          }
+          if (chunk.conversationId) {
+            conv = chunk.conversationId;
+            saveConv(id, conv);
+            $('conversationId').value = conv;
+          }
+          if (chunk.usage && chunk.usage.total_tokens) {
+            entry.time.textContent = chunk.usage.total_tokens + ' tok';
+          }
+        });
+
+        if (signal && signal.aborted) {
+          const err = new Error('aborted');
+          err.name = 'AbortError';
+          throw err;
+        }
+
+        entry.body.classList.remove('caret');
+        entry.text = text;
+        entry.body.innerHTML = window.marked
+          ? window.marked.parse(text || '_（空回答）_')
+          : escapeHtml(text || '（空回答）');
+
+        if (conv) {
+          $('conversationId').value = conv;
+        }
+      }
+
+      function escapeHtml(value) {
+        return String(value).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      }
+
+      $('sendBtn').addEventListener('click', sendAll);
+      $('stopBtn').addEventListener('click', () => {
+        if (inFlight) {
+          inFlight.abort();
+        }
+      });
+      $('newChatBtn').addEventListener('click', () => {
+        for (const id of PROVIDERS) {
+          saveConv(id, '');
+        }
+        $('conversationId').value = '';
+        setStatus($('playStatus'), 'ok', '已清空所有会话号，下次提问会开新会话。');
+      });
+      $('copyAllBtn').addEventListener('click', async () => {
+        const parts = [...answers.entries()]
+          .filter(([, entry]) => entry.text)
+          .map(([id, entry]) => '## ' + (LABELS[id] || id) + '\n\n' + entry.text);
+        if (!parts.length) {
+          setStatus($('playStatus'), 'warn', '还没有可复制的回答。');
+          return;
+        }
+        try {
+          await navigator.clipboard.writeText(parts.join('\n\n---\n\n'));
+          setStatus($('playStatus'), 'ok', '已复制全部回答。');
+        } catch {
+          setStatus($('playStatus'), 'err', '浏览器拒绝了剪贴板访问。');
+        }
+      });
+      $('prompt').addEventListener('keydown', (event) => {
+        // ⌘/Ctrl + Enter 直接发，跟聊天软件的习惯一致
+        if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
+          event.preventDefault();
+          sendAll();
+        }
+      });
+
+      /* ══ 会话管理 ════════════════════════════════════════════ */
+      async function loadSessionView() {
+        const provider = $('sessionProvider').value;
+        setStatus($('sessionStatus'), 'busy', '读取中…');
+        try {
+          // /sessions 给全部会话，/providers/:provider 给该 provider 的配置与实时状态。
+          // 没有 /status/:provider 这个端点，别去请求它。
+          const [sessions, config] = await Promise.all([
+            api('/sessions'),
+            api('/providers/' + provider),
+          ]);
+          const mine = Array.isArray(sessions?.sessions)
+            ? sessions.sessions.filter((s) => s.provider === provider)
+            : sessions;
+          $('sessionList').textContent = pretty(mine);
+          $('providerConfig').textContent = pretty(config);
+          setStatus($('sessionStatus'), 'ok', '已刷新。');
+        } catch (error) {
+          setStatus($('sessionStatus'), 'err', String(error?.message || error));
+        }
+      }
+
+      $('refreshStatusBtn').addEventListener('click', loadSessionView);
+
+      $('openSessionBtn').addEventListener('click', async () => {
+        const provider = $('sessionProvider').value;
+        setStatus($('sessionStatus'), 'busy', '正在打开…');
+        try {
+          const payload = await api('/session/' + provider + '/open', { method: 'POST' });
+          setStatus($('sessionStatus'), 'ok', '已打开。' + (payload?.url ? ' ' + payload.url : ''));
+        } catch (error) {
+          setStatus($('sessionStatus'), 'err', String(error?.message || error));
+        }
+      });
+
+      $('inspectPageBtn').addEventListener('click', async () => {
+        const provider = $('sessionProvider').value;
+        $('inspectDump').textContent = '探测中…';
+        try {
+          // 这个端点是 GET，且 provider 在 query 上——写成 POST /session/x/inspect 会 404
+          const payload = await api('/session/' + provider + '/inspect');
+          $('inspectDump').textContent = pretty(payload);
+        } catch (error) {
+          $('inspectDump').textContent = String(error?.message || error);
+        }
+      });
+
+      $('clearSessionBtn').addEventListener('click', () => {
+        const provider = $('sessionProvider').value;
+        saveConv(provider, '');
+        setStatus(
+          $('sessionStatus'),
+          'ok',
+          '已清空 ' + (LABELS[provider] || provider) + ' 的会话号。',
+        );
+      });
+
+      $('reloadSelectorsBtn').addEventListener('click', async () => {
+        const provider = $('sessionProvider').value;
+        try {
+          await api('/providers/reload', { method: 'POST' });
+          const config = await api('/providers/' + provider);
+          $('providerConfig').textContent = pretty(config);
+          setStatus($('sessionStatus'), 'ok', '已重载。');
+        } catch (error) {
+          setStatus($('sessionStatus'), 'err', String(error?.message || error));
+        }
+      });
+
+      /* ══ 多模型会议 ══════════════════════════════════════════
+         两种编排方式：
+           顺序对话 round-robin —— 模型依次发言，后一个能看到前面的全部发言
+           并行作答 parallel     —— 各模型独立回答同一问题，互不可见，最后汇总
+         两种都由独立的总结者收口。服务端模板 id 就对应这两个 mode。
+      ─────────────────────────────────────────────────────── */
+      const meetingState = { pending: false, mode: 'round-robin' };
+
+      /** 服务端模板 id 里的 -web 后缀是给网页 provider 用的，页面上不显示。 */
+      function templateId(mode) {
+        return mode === 'parallel' ? 'meeting-parallel-web' : 'meeting-round-robin-web';
+      }
+
+      /** 发给服务端的 participants 就是 seats 的 provider 序列，顺序即发言顺序。 */
+      function meetingRoster() {
+        return seats.map((seat) => seat.provider);
+      }
+
+      /**
+       * 席位状态。每一项是 { provider }，数组下标即发言顺序——
+       * 服务端按 participants 数组顺序分配席位名，所以这里不用另存序号。
+       */
+      let seats = MEETING_DEFAULTS.map((provider) => ({ provider }));
+
+      /**
+       * 席位名来自服务端，不在这里自己算。
+       *
+       * 席位名（deepseek1 / deepseek2）**同时是会话身份**——它会进
+       * conversationId，两边算法一旦漂移就会静默复用错会话。
+       * 所以只认 /meeting/plan 的返回值。
+       */
+      let seatAliases = [];
+
+      async function refreshSeatNames() {
+        try {
+          const plan = await api('/meeting/plan', {
+            method: 'POST',
+            body: JSON.stringify({
+              template: templateId(meetingState.mode),
+              participants: seats.map((seat) => seat.provider),
+              summarizer: $('meetingSummarizer').value,
+              ...($('summarizerSeat').value ? { summarizerSeat: $('summarizerSeat').value } : {}),
+            }),
+          });
+          seatAliases = plan.participants.map((p) => p.alias);
+          return plan;
+        } catch {
+          // 拿不到就退回按序编号，仅用于显示；发送时服务端仍会重算，
+          // 所以最坏情况是标签显示旧名，不会真的复用错会话。
+          const counters = new Map();
+          seatAliases = seats.map((seat) => {
+            const nth = (counters.get(seat.provider) ?? 0) + 1;
+            counters.set(seat.provider, nth);
+            return `${seat.provider}${nth}`;
+          });
+          return null;
+        }
+      }
+
+      async function renderSeats(streamKinds) {
+        await refreshSeatNames();
+        const list = $('seatList');
+        list.innerHTML = '';
+        const names = seatAliases;
+        const summarySeat = $('summarizerSeat').value;
+
+        seats.forEach((seat, index) => {
+          const name = names[index];
+          const row = document.createElement('div');
+          row.className = 'seat';
+          row.dataset.summary = String(summarySeat === name);
+
+          const order = document.createElement('span');
+          order.className = 'seat-index';
+          order.textContent = String(index + 1);
+
+          const picker = document.createElement('select');
+          for (const id of PROVIDERS) {
+            const option = document.createElement('option');
+            option.value = id;
+            option.textContent = LABELS[id] || id;
+            picker.append(option);
+          }
+          picker.value = seat.provider;
+          picker.addEventListener('change', async () => {
+            seats[index].provider = picker.value;
+            // 改了 provider，席位名会变（deepseek2 → chatgpt2），
+            // 所以原先复用的席位可能已经不存在了，要重置成新会话。
+            await renderSeats(streamKinds);
+            pruneSummarizerSeat();
+          });
+
+          const label = document.createElement('span');
+          label.className = 'seat-name';
+          label.textContent = name;
+          label.title = '席位名即会话标识';
+
+          if (row.dataset.summary === 'true') {
+            const badge = document.createElement('span');
+            badge.className = 'seat-badge';
+            badge.textContent = '负责总结';
+            row.append(badge);
+          }
+
+          const btns = document.createElement('span');
+          btns.className = 'seat-btns';
+          const up = document.createElement('button');
+          up.type = 'button';
+          up.className = 'ghost';
+          up.textContent = '↑';
+          up.title = '上移';
+          up.disabled = index === 0;
+          up.addEventListener('click', async () => {
+            [seats[index - 1], seats[index]] = [seats[index], seats[index - 1]];
+            await renderSeats(streamKinds);
+            renderRosterHint();
+          });
+          const down = document.createElement('button');
+          down.type = 'button';
+          down.className = 'ghost';
+          down.textContent = '↓';
+          down.title = '下移';
+          down.disabled = index === seats.length - 1;
+          down.addEventListener('click', async () => {
+            [seats[index + 1], seats[index]] = [seats[index], seats[index + 1]];
+            await renderSeats(streamKinds);
+            renderRosterHint();
+          });
+          const remove = document.createElement('button');
+          remove.type = 'button';
+          remove.className = 'danger';
+          remove.textContent = '×';
+          remove.title = '移除';
+          remove.addEventListener('click', async () => {
+            seats.splice(index, 1);
+            await renderSeats(streamKinds);
+            pruneSummarizerSeat();
+            renderRosterHint();
+          });
+          btns.append(up, down, remove);
+
+          row.append(order, picker, label, btns);
+          list.append(row);
+        });
+
+        renderSummarizerOptions();
+        renderRosterHint();
+      }
+
+      /** 总结者的会话来源：新建，或复用某个参与者席位。 */
+      function renderSummarizerOptions() {
+        const select = $('summarizerSeat');
+        const previous = select.value;
+        select.innerHTML = '';
+
+        const fresh = document.createElement('option');
+        fresh.value = '';
+        fresh.textContent = '新会话（独立收口）';
+        select.append(fresh);
+
+        for (const name of seatAliases) {
+          const option = document.createElement('option');
+          option.value = name;
+          option.textContent = `复用 ${name} 的会话（能看到它之前的发言）`;
+          select.append(option);
+        }
+
+        // 席位被删或改名后，原先选的那个可能已经不存在
+        select.value = [...select.options].some((o) => o.value === previous) ? previous : '';
+
+        renderSeatHint();
+      }
+
+      /** 席位被删或改名后，把已失效的"复用席位"选择退回新会话。 */
+      function pruneSummarizerSeat() {
+        const select = $('summarizerSeat');
+        const current = select.value;
+        if (current && !seatAliases.includes(current)) {
+          select.value = '';
+        }
+        renderSeatHint();
+      }
+
+      function renderSeatHint() {
+        const name = $('summarizerSeat').value;
+        $('seatHint').textContent = name
+          ? `会在 ${name} 的同一个网页会话里收口，因此它记得自己刚才那轮说了什么。`
+          : '每次总结都用一个全新的会话，只有本次收集到的发言。';
+      }
+
+      function renderRosterHint() {
+        const hint = $('rosterHint');
+        if (seats.length < 2) {
+          hint.textContent = '至少需要两个参与者。';
+          return;
+        }
+        const names = seatAliases;
+        if (meetingState.mode === 'round-robin') {
+          hint.textContent =
+            '发言顺序：' +
+            names.map((n, i) => `${i + 1}. ${n}`).join(' → ') +
+            '。同一个 provider 出现多次会各自开会话（' +
+            PROVIDERS.length +
+            ' 家上限由服务端限制为 6 个席位）。';
+        } else {
+          hint.textContent =
+            `${names.length} 个席位会同时回答，互不可见：${names.join('、')}。` +
+            '注意：同一家 provider 的多个席位共用一个网页标签页，并行时会互相干扰，建议每家只选一次。';
+        }
+      }
+
+      $('addSeatBtn').addEventListener('click', async () => {
+        const used = new Set(seats.map((s) => s.provider));
+        // 优先补没选过的 provider，其次复用第一个，避免一下撞上"同标签页并发"
+        const next = PROVIDERS.find((id) => !used.has(id)) ?? PROVIDERS[0];
+        seats.push({ provider: next });
+        await renderSeats(streamKindsCache);
+        renderRosterHint();
+      });
+
+      $('clearSeatsBtn').addEventListener('click', async () => {
+        seats = [];
+        await renderSeats(streamKindsCache);
+        renderRosterHint();
+      });
+
+      $('summarizerSeat').addEventListener('change', async () => {
+        renderSeatHint();
+        await renderSeats(streamKindsCache);
+      });
+
+      for (const button of document.querySelectorAll('#modePicker .mode')) {
+        button.addEventListener('click', () => {
+          meetingState.mode = button.dataset.mode;
+          for (const other of document.querySelectorAll('#modePicker .mode')) {
+            other.setAttribute('aria-pressed', String(other === button));
+          }
+          renderMeetingHint();
+          renderRosterHint();
+        });
+      }
+
+      function addMeetingBubble(who, html, sub) {
+        const chat = $('meetingChat');
+        const row = document.createElement('div');
+        row.className = 'bubble-row' + (who === 'user' ? ' user' : '');
+        const bubble = document.createElement('div');
+        bubble.className = 'bubble';
+        const meta = document.createElement('div');
+        meta.className = 'bubble-meta';
+        meta.textContent = sub || (who === 'user' ? '你' : '会议助手');
+        bubble.append(meta);
+        const body = document.createElement('div');
+        body.innerHTML = html;
+        bubble.append(body);
+        row.append(bubble);
+        chat.append(row);
+        chat.scrollTop = chat.scrollHeight;
+      }
+
+      async function sendMeeting() {
+        if (meetingState.pending) {
+          return;
+        }
+        const text = $('meetingComposer').value.trim();
+        if (!text) {
+          setStatus($('meetingStatus'), 'warn', '消息是空的。');
+          return;
+        }
+        const roster = meetingRoster();
+        if (roster.length < 2) {
+          setStatus($('meetingStatus'), 'warn', '会议至少需要两个参与者。');
+          return;
+        }
+
+        meetingState.pending = true;
+        $('meetingSendBtn').disabled = true;
+        addMeetingBubble('user', escapeHtml(text).replace(/\n/g, '<br>'));
+        $('meetingComposer').value = '';
+        setStatus(
+          $('meetingStatus'),
+          'busy',
+          meetingState.mode === 'round-robin'
+            ? `${roster.length} 个模型依次发言中…`
+            : `${roster.length} 个模型同时回答中…`,
+        );
+
+        const summaryBody = document.createElement('div');
+        summaryBody.className = 'muted';
+        summaryBody.textContent = '等待总结者收口…';
+        const summaryRow = document.createElement('div');
+        summaryRow.className = 'bubble-row';
+        const summaryBubble = document.createElement('div');
+        summaryBubble.className = 'bubble';
+        const summaryMeta = document.createElement('div');
+        summaryMeta.className = 'bubble-meta';
+        const reusedSeat = $('summarizerSeat').value;
+        summaryMeta.textContent = reusedSeat
+          ? `总结者 · 复用 ${reusedSeat} 的会话`
+          : '总结者 · 新会话';
+        summaryBubble.append(summaryMeta, summaryBody);
+        summaryRow.append(summaryBubble);
+        $('meetingChat').append(summaryRow);
+        summaryRow.hidden = true;
+
+        let summaryText = '';
+        try {
+          // 会议也走 /v1/chat/completions：没有 /v1/chat/meeting 这个路由。
+          // model 选模板。**participants 必须是数组**——schema 要求
+          // z.array(provider)，早先这里传的是 "a,b,c" 字符串，校验直接拒绝，
+          // 也就是说会议模式在 UI 里从来没真正发出去过。
+          const payload = {
+            model: templateId(meetingState.mode),
+            meeting: {
+              participants: roster,
+              summarizer: $('meetingSummarizer').value,
+              rounds: Number($('meetingRounds').value) || 1,
+              // 复用席位时传席位名，服务端据此沿用同一个 conversationId；
+              // 留空则开新会话。见 renderSummarizerOptions。
+              ...($('summarizerSeat').value ? { summarizerSeat: $('summarizerSeat').value } : {}),
+            },
+            messages: [{ role: 'user', content: text }],
+            stream: true,
+          };
+          const conv = $('meetingConversationId').value.trim();
+          if (conv) {
+            payload.conversationId = conv;
+          }
+
+          await readEventStream('/v1/chat/completions', payload, (chunk) => {
+            if (chunk.conversationId) {
+              $('meetingConversationId').value = chunk.conversationId;
+            }
+
+            // 逐个成员的发言事件：顺序模式下必须让人看到谁在什么时候说了什么
+            if (chunk.type === 'meeting.entry' && chunk.entry) {
+              const entry = chunk.entry;
+              // 用席位名（deepseek1 / deepseek2）而不是 provider 名——同一家的
+              // 两个席位光看 provider 分不出来，而它正是会话身份。
+              const who = entry.speaker || '成员';
+              const tag = entry.stage === 'discussion' ? '' : ' · ' + (entry.stage || '');
+              addMeetingBubble(
+                'assistant',
+                escapeHtml(entry.content || '').replace(/\n/g, '<br>'),
+                who + tag,
+              );
+              return;
+            }
+            if (chunk.type === 'meeting.error') {
+              throw new Error(chunk.error?.message || '会议出错');
+            }
+
+            const delta = chunk?.choices?.[0]?.delta?.content;
+            if (typeof delta === 'string' && delta) {
+              summaryRow.hidden = false;
+              summaryText += delta;
+              summaryBody.textContent = summaryText;
+              summaryRow.scrollIntoView({ block: 'nearest' });
+            }
+          });
+
+          if (summaryText) {
+            summaryRow.hidden = false;
+            summaryBody.textContent = summaryText;
+            setStatus($('meetingStatus'), 'ok', '会议完成。');
+          } else {
+            summaryRow.remove();
+            setStatus($('meetingStatus'), 'warn', '没有拿到总结答复。');
+          }
+        } catch (error) {
+          summaryRow.hidden = false;
+          summaryBody.textContent = '';
+          const box = document.createElement('div');
+          box.className = 'status';
+          box.dataset.tone = 'err';
+          box.textContent = String(error?.message || error);
+          summaryBubble.append(box);
+          setStatus($('meetingStatus'), 'err', '会议失败。');
+        } finally {
+          meetingState.pending = false;
+          $('meetingSendBtn').disabled = false;
+        }
+      }
+
+      $('meetingSendBtn').addEventListener('click', sendMeeting);
+      $('meetingNewBtn').addEventListener('click', () => {
+        $('meetingConversationId').value = '';
+        $('meetingChat').innerHTML = '';
+        $('meetingDetails').textContent = '发送后这里会显示。';
+        setStatus($('meetingStatus'), 'ok', '已开新一轮，下次发送会用新的会话号。');
+      });
+      $('clearMeetingBtn').addEventListener('click', () => {
+        $('meetingNewBtn').click();
+      });
+      $('meetingComposer').addEventListener('keydown', (event) => {
+        if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
+          event.preventDefault();
+          sendMeeting();
+        }
+      });
+
+      /* ══ 启动 ════════════════════════════════════════════════ */
+      async function boot() {
+        // 会话管理页的 provider 下拉
+        const sessionSelect = $('sessionProvider');
+        sessionSelect.innerHTML = '';
+        for (const id of PROVIDERS) {
+          const option = document.createElement('option');
+          option.value = id;
+          option.textContent = LABELS[id] || id;
+          sessionSelect.append(option);
+        }
+        sessionSelect.value = 'deepseek';
+
+        // 总结者下拉：六家都能当总结者
+        const summarizerSelect = $('meetingSummarizer');
+        for (const id of PROVIDERS) {
+          const option = document.createElement('option');
+          option.value = id;
+          option.textContent = LABELS[id] || id;
+          summarizerSelect.append(option);
+        }
+        summarizerSelect.value = 'deepseek';
+
+        // 真流标记：让用户知道每个 provider 的答案来源
+        const streamKinds = {};
+        try {
+          const payload = await api('/providers');
+          const items = Array.isArray(payload) ? payload : payload?.providers || [];
+          for (const item of items) {
+            const id = item.id || item.provider;
+            streamKinds[id] = item.streamCapture ? item.streamCapture.reducer : null;
+          }
+        } catch {
+          /* 拿不到就不标，走默认 DOM 样式 */
+        }
+
+        pickDefaults();
+        renderModelGrid(streamKinds);
+        streamKindsCache = streamKinds;
+        await renderSeats(streamKinds);
+        renderMeetingHint();
+        $('bridgeToken').value = readBridgeToken();
+        $('bridgeToken').addEventListener('change', () => {
+          try {
+            sessionStorage.setItem('bridge.token', $('bridgeToken').value);
+          } catch {
+            /* 忽略 */
+          }
+        });
+
+        // 恢复各 provider 上次的会话号
+        const last = PROVIDERS.map(loadConv).filter(Boolean);
+        if (last.length === 1) {
+          $('conversationId').value = last[0];
+        }
+
+        await refreshHealth();
+        setInterval(refreshHealth, 20000);
+      }
+
+      boot();
+    </script>
+  </body>
+</html>

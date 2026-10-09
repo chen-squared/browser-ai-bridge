@@ -17,9 +17,11 @@ browser-ai-bridge 是一个本地 HTTP 桥接服务，通过 Playwright 复用�
 - [工作原理](#工作原理)
 - [支持的 Provider](#支持的-provider)
 - [快速开始](#快速开始)
+- [控制台](#控制台)
 - [配置](#配置)
 - [API 参考](#api-参考)
 - [多轮会话管理](#多轮会话管理)
+- [多模型会议](#多模型会议)
 - [功能开关：搜索与推理](#功能开关搜索与推理)
 - [Selector 维护](#selector-维护)
 - [已知限制](#已知限制)
@@ -140,6 +142,59 @@ curl http://127.0.0.1:3010/v1/chat/completions \
 
 ---
 
+## 控制台
+
+`http://127.0.0.1:3010` 提供四个标签页。
+
+### 并排对比
+
+勾选多个模型 → 并行提问 → 答案并排显示。每个模型各记各的 `conversationId`，
+所以下次接着聊不会串。同一模型内部会自己排队，不会互相踩。
+
+每个模型门牌上标了答案来源：
+
+- **真流** —— 正文来自网页自己收到的协议数据，思考与回答由协议字段区分
+- **DOM** —— 正文从页面文本推断，可能受页面排版影响
+
+这个标记来自 `GET /providers` 的 `streamCapture` 字段。五家已接真流，gemini 仍是
+DOM 兜底（原因见[真流捕获](#真流捕获哪些-provider-支持)）。
+
+### 多模型会议
+
+两种编排方式：
+
+| 模式 | 模板 id | 行为 |
+|---|---|---|
+| 顺序对话 | `meeting-round-robin-web` | 席位依次发言，**后一个能看到前面所有发言** |
+| 并行作答 | `meeting-parallel-web` | 所有席位同时回答同一问题，**彼此看不见** |
+
+两者都由一个**独立的总结者**收口成一条答复。
+
+#### 席位与顺序
+
+席位顺序即发言顺序，在界面上用 ↑↓ 调整。同一 provider 可以出现多次，
+各自占一个独立会话，用序号区分：
+
+```
+参与者顺序 [deepseek, chatgpt, deepseek]
+→ 席位 deepseek1 → chatgpt1 → deepseek2
+```
+
+**席位名同时是会话身份**——它会进 `conversationId`（`<meetingId>:<alias>`），
+同名即同一会话。所以命名由服务端统一计算（`POST /meeting/plan`），
+前端不自己实现，避免两边算法漂移导致静默复用错会话。
+
+#### 总结时用哪个会话
+
+`summarizerSeat` 控制总结走哪个会话：
+
+- **不传** → 开新会话（`<provider>-summary`），只有本次收集到的发言
+- **传某个席位名** → 复用该席位的会话，总结者能接着自己上一轮发言往下说
+
+指定一个不存在的席位名会退回新会话，不会静默复用错的。
+
+---
+
 ## 配置
 
 所有配置项通过 `.env` 文件设置：
@@ -228,6 +283,43 @@ curl -X POST http://127.0.0.1:3010/providers/reload
 
 ---
 
+### `POST /meeting/plan`
+
+只计算会议编排计划，**不碰浏览器、不发任何消息**。
+
+存在的理由：席位名（`deepseek1` / `deepseek2`）**同时是会话身份**，让前端自己
+算一遍的话，两边算法一旦漂移就会静默复用错会话——那是最难发现的一类 bug。
+所以这里让服务端算、前端照抄。
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `template` | `string` | ✅ 会议模板 id |
+| `participants` | `ProviderId[]` | 顺序即发言顺序，最多 6 个 |
+| `summarizer` | `ProviderId` | 总结者用哪家 |
+| `summarizerSeat` | `string` | 复用哪个席位的会话；不传则开新会话 |
+| `rounds` | `number` | 发言轮数 1–4 |
+
+```bash
+curl -X POST http://127.0.0.1:3010/meeting/plan \
+  -H 'content-type: application/json' \
+  -d '{"template":"meeting-round-robin-web","participants":["deepseek","chatgpt","deepseek"],"summarizer":"qwen"}'
+```
+
+```json
+{
+  "mode": "round-robin",
+  "rounds": 2,
+  "participants": [
+    { "alias": "deepseek1", "provider": "deepseek" },
+    { "alias": "chatgpt1", "provider": "chatgpt" },
+    { "alias": "deepseek2", "provider": "deepseek" }
+  ],
+  "summarizer": { "alias": "qwen-summary", "provider": "qwen" }
+}
+```
+
+---
+
 ### `POST /session/:provider/open`
 
 打开指定 provider 的登录页，并将浏览器窗口切至前台。
@@ -283,10 +375,135 @@ curl -X POST http://127.0.0.1:3010/session/deepseek/clear \
 
 | 场景 | `conversationId` | 行为 |
 |------|-----------------|------|
-| 单轮问答 / 调试 | 不传（留空） | 每次请求使用独立页面，不继承历史 |
-| 连续多轮对话 | 传固定值（如 `session-1`） | 复用同一网页页签，由网页自身维护上下文 |
+| 开新对话 | 不传（留空） | 新建标签页，导航到该provider 的"新建对话"页 |
+| 连续多轮对话 | 带上上次响应里返回的 `conversationId` | 复用同一网页页签，由网页自身维护上下文 |
 
 **重要**：不同的 provider 即使传相同的 `conversationId` 也是相互独立的会话（`deepseek:session-1` ≠ `chatgpt:session-1`）。
+
+### 推荐的续聊方式：回传 `conversationId`
+
+发送成功后，服务端会从页面 URL 里抽出该provider 真实的会话 id，并放在响应的
+`conversationId` 字段里。**把它带回去发下一次，就等于"继续这条对话"**：
+
+```bash
+# 第一次：不传 conversationId，服务端新建标签页与新对话
+curl -s http://127.0.0.1:3010/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"deepseek-web","messages":[{"role":"user","content":"记住这个词：紫貂"}]}'
+# → { ..., "conversationId": "b258f46d-0b5a-405e-a177-0d904d6979f7" }
+
+# 第二次：带上它，服务端复用同一个标签页并回到那条对话
+curl -s http://127.0.0.1:3010/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"deepseek-web","conversationId":"b258f46d-0b5a-405e-a177-0d904d6979f7",
+       "messages":[{"role":"user","content":"我刚才让你记的词是什么？"}]}'
+```
+
+这样"是否连续"由调用方显式决定，而不需要服务端靠启发式去猜。服务端只在**标签页
+已经不存在**时才会按记住的 URL 重新导航过去；标签页还在时直接复用，不做任何跳转。
+
+各provider 的会话 URL 形态（已实测）：
+
+| provider | 会话 URL |
+|---|---|
+| chatgpt | `https://chatgpt.com/c/<uuid>` |
+| gemini | `https://gemini.google.com/app/<id>` |
+| claude | `https://claude.ai/chat/<uuid>` |
+| grok | `https://grok.com/c/<uuid>` |
+| qwen | `https://chat.qwen.ai/c/<uuid>` |
+| deepseek | `https://chat.deepseek.com/a/chat/s/<uuid>` |
+
+识别规则写在 `src/providers/registry.ts` 的 `conversationUrlPattern`，可以直接改，
+也可以放在 `selectors.overrides.json` 里热重载。
+
+### 复用规则：完全由请求里的历史前缀决定
+
+用 `u` 表示用户轮、`a` 表示助手轮。**复用一个标签页的唯一条件是：你这次带回来的
+历史，正好是该标签页已有 transcript 的前缀。** 服务端不会替你猜测对话是否延续。
+
+设某标签页当前停在 `u1a1`：
+
+| 本次请求带的历史 | 是否复用 | 原因 |
+|---|---|---|
+| `u1a1u2` | ✅ 复用 | 是前缀，补发 `u2` |
+| `u1a1u2a2u3`（该页停在 `u1a1u2a2`） | ✅ 复用 | 是前缀，补发 `u3` |
+| 只有 `u2`（不带历史） | ❌ 不复用 | 没有前缀可比，判定为新话题 |
+| `u1a1u3`（该页停在 `u1a1u2`） | ❌ 不复用 | 在第 3 位分叉（`u2` ≠ `u3`） |
+| `u1a2u2`（该页停在 `u1a1`） | ❌ 不复用 | 在第 2 位分叉（`a1` ≠ `a2`） |
+
+几个容易踩的点：
+
+- **不带历史 = 每次新开对话。** 如果你的客户端是无状态的（每轮只发最新一句
+  user 消息、不回传历史），那它每次都会拿到一条新对话。想续聊就必须把历史带回来。
+- **assistant 内容只做空白层面的归一化比较**（CRLF、尾随空格、连续多余空行、
+  首尾空白）。服务端存的是网页里模型**实际产出**的文本，和你客户端里那份副本
+  常有排版差异；不做归一化的话，一个尾随空格就会被误判成换了话题而丢弃标签页。
+  但语义内容必须一致——`a1` 和 `a2` 永远判为不同。
+- 想换话题时，除了带上一份不同的历史，也可以直接换一个新的 `conversationId`，
+  或 `POST /session/:provider/clear`。
+
+`sessionTranscriptMode` 影响比对方式：`raw`（默认）要求严格前缀一致；
+`context-window` 允许上下文窗口滑动，做子序列匹配。用 `dryRun: true` 可以在
+`debug.syncMode`（`fresh` / `append` / `rebuild`）、`debug.syncDebug.reason`
+（`strict-append` / `context-window-append` / `context-diverged` /
+`no-existing-session` / `empty-cache-with-existing-session`）以及
+`debug.syncDebug.divergenceIndex`（分叉发生在第几位）里看到判定结果，
+不发消息就能预判这次会不会复用。
+
+### 真流捕获（哪些 provider 支持）
+
+内容可以有两个来源：**真流**（直接读网页自己收到的那条协议数据）或 **DOM 抓取**。
+真流更准——思考与回答靠协议字段区分、不必猜 DOM 块，还能拿到真实 token 计数。
+配了真流的 provider 优先走真路，失败静默退回 DOM 兜底，功能不受影响。
+
+| provider | 传输 | 归约方式 | 真 TTFT |
+|---|---|---|---|
+| qwen | HTTP SSE | 累加 delta（相邻去重） | ❌ |
+| deepseek | HTTP SSE | 补丁状态机 | ❌ |
+| **grok** | **WebSocket** | OpenAI Responses 形状 | ✅ |
+| **chatgpt** | HTTP SSE | 补丁协议（`event: delta` 成对切帧） | ❌ |
+| **claude** | **HTTP JSON** | 会话快照（**不是 SSE**） | ❌ |
+| gemini | `batchexecute` RPC | DOM 兜底 | — |
+
+当前状态可用 `GET /providers/<provider>` 查看 `streamCapture` 字段确认。
+
+**首字延迟（TTFT）只有 WebSocket 能拿到。** HTTP 只能在生成结束后一次性取到
+完整 body——Playwright 的 `Response` 只有 `body()` / `text()` / `json()`，全是
+"全有或全无"，没有任何部分读取的口子（1.64.0 也是如此，升级解决不了）。
+WebSocket 帧则是实时事件，所以能边收边推。
+
+因此取 HTTP 真流时**必须等它到**：实测 ChatGPT 的 `response.finished()` 要 11 秒
+才resolve，而 DOM"稳定"往往更早判定。不等就会静默退回 DOM——而 ChatGPT 的 DOM 里
+混着"思考 / 搜索网页"这类按钮文字，会抓出 `思考\n创建图像或贴纸…` 这种垃圾。
+`awaitCapturedStream` 就是为此存在的：拿到内容就返回，最多等 18 秒。
+
+**chatgpt 与 claude 各有一个必须注意的坑：**
+
+- **chatgpt** —— 正文帧带 `event: delta` 头，`data:` **不在块首**。按"块首是
+  `data:`"过滤会把正文整个丢掉（实测 21 个事件里只剩 8 帧、含正文 0 帧）。所以必须
+  用 `parseSseEvents` 成对切分。
+- **claude** —— 它的 SSE 里中文是**坏的**：`静`（UTF-8 `E9 9D 99`）取出来变成
+  `é<U+009D>™`，正是 UTF-8 被按 CP1252 逐字节误解码的特征（CP1252 里 `0x99` 是 `™`）。
+  而同一时刻的会话 JSON 端点文字完全正确——所以走 JSON，不走 SSE。
+
+**gemini 仍未接入**，原因写在 `src/providers/registry.ts` 的注释里：端点已定位
+（`…/BardFrontendService/StreamGenerate`），body 也能取到，但抓到的只有配额耗尽的
+错误码 `BardErrorInfo [1099]`，**没有真实答案样本**，归约器无法验证。它是 Google
+私有格式，没样本就只能靠猜内部结构写代码——那不如等配额重置。在那之前走 DOM。
+
+### 标签页生命周期
+
+- 每个 provider 最多保留 8 个标签页，闲置超过 2 小时的会被自动关闭回收。
+  上限必须容得下**一次会议里同一 provider 的全部席位**（6 席位 + 1 总结者 = 7 个），
+  否则并发建页时后建的会把先建的挤掉关闭，表现为"未找到回复节点"或
+  "发送按钮未确认提交成功"——看着像站点问题，其实是自己回收了自己的标签页
+- 复用前会校验标签页是否还在该 provider 的站点上、且仍处在预期的那个对话里。
+  若你手动在那个标签页里切到了别的对话或别的站点，服务端会丢弃它并重建，
+  而不是静默把消息写进错误的页面
+
+各 provider 的"新建对话"页配在 `registry.ts` 的 `newChatUrl`；不填则退回 `url`。
+**注意**：不少站点的首页会自动恢复上一次对话，只配置 `url` 的话，"第一条新消息"
+可能会被追加进一个无关的旧对话——确认过的新对话页请填进 `newChatUrl`。
 
 ### 默认消息发送策略
 
@@ -303,6 +520,68 @@ curl -X POST http://127.0.0.1:3010/session/deepseek/clear \
 - 会话仅在服务进程内存中维护，**重启服务后失效**。
 - 如果对应的网页页签被关闭，或页面状态不可用，服务会自动尝试导航回 provider 入口页后重试。
 - 可通过 `POST /session/:provider/clear` 手动清除会话映射。
+
+---
+
+## 多模型会议
+
+把 `model` 设成会议模板 id 即进入会议模式，走同一个 `POST /v1/chat/completions`。
+
+| 模板 id | 模式 | 行为 |
+|---|---|---|
+| `meeting-round-robin-web` | 顺序对话 | 席位依次发言，**后一个能看到前面所有发言** |
+| `meeting-parallel-web` | 并行作答 | 所有席位同时回答同一问题，**彼此看不见** |
+
+两种都由一个独立的总结者收口成一条答复。
+
+### 请求体
+
+```json
+{
+  "model": "meeting-round-robin-web",
+  "messages": [{ "role": "user", "content": "比较一下这三种实现" }],
+  "meeting": {
+    "participants": ["deepseek", "chatgpt", "deepseek"],
+    "summarizer": "qwen",
+    "summarizerSeat": "deepseek1",
+    "rounds": 1
+  },
+  "stream": true
+}
+```
+
+| 字段 | 说明 |
+|---|---|
+| `participants` | 顺序即发言顺序，最多 6 个 |
+| `summarizer` | 总结者用哪家 |
+| `summarizerSeat` | 复用哪个席位的会话；**不传则开新会话** |
+| `rounds` | 发言轮数 1–4 |
+
+### 席位命名
+
+同一 provider 可以出现多次，各自占一个独立会话，用序号区分：
+
+```
+participants [deepseek, chatgpt, deepseek]
+→ 席位 deepseek1 → chatgpt1 → deepseek2
+```
+
+**席位名同时是会话身份**（进 `conversationId`），所以命名统一由服务端计算，
+控制台通过 `POST /meeting/plan` 取，不在前端实现。
+
+### 流式事件
+
+`stream: true` 时，会议除了进度事件，最后还会按 OpenAI 形状补发总结答复的
+chunk——所以按 `chat/completions` 解析的客户端能用同一条 delta 逻辑读出总结：
+
+| 事件 | 含义 |
+|---|---|
+| `meeting.started` | 编排计划（席位、顺序、总结者、策略） |
+| `meeting.entry` | 某一句发言（`entry.speaker` 是席位名，`entry.stage` 是阶段） |
+| `choices[].delta.content` | 总结者的答复正文 |
+| `meeting.error` | 出错 |
+
+界面上用 `⌘/Ctrl + Enter` 发送。
 
 ---
 
@@ -429,10 +708,18 @@ src/
 ├── config.ts               # 环境变量配置（Zod 校验）
 ├── types.ts                # TypeScript 类型定义
 ├── prompt.ts               # 消息规范化逻辑
-├── meeting.ts              # 多 provider 会议编排
+├── meeting.ts              # 多 provider 会议编排（席位、顺序、总结）
+├── stream-capture.ts       # 真流归约器（每家一套协议，不能互相套用）
+├── session-sync.ts         # 复用还是续写：由历史前缀决定，不靠猜
+├── conversation-identity.ts # 会话 id 抽取、同站点判定、标签页回收
+├── http-access.ts          # Host 白名单（防 DNS rebinding）、可选 token
+├── sse-chunks.ts           # 把答复切成 SSE chunk（按码点，不劈代理对）
+├── console/
+│   └── index.html          # 控制台入口页（构建时拷进 dist）
 ├── browser/
 │   ├── browser-manager.ts  # 浏览器生命周期管理（启动、页面复用）
 │   ├── provider-client.ts  # DOM 交互（定位输入框、发送、提取回复）
+│   ├── response-text.ts    # 占位残渣过滤与长度门槛
 │   └── markdown-restoration.ts  # Markdown token 还原
 └── providers/
     └── registry.ts         # 各 provider 的 selector 配置与覆盖逻辑
@@ -472,6 +759,43 @@ npm test
 - 控制台页面（`http://<server-ip>:3010`）可以触发服务端打开浏览器、显示当前页面 URL、确认操作结果。
 - 无法将服务端的 GUI 浏览器画面嵌入控制台页面。
 - 如需查看和操作远程浏览器，需配合 VNC、屏幕共享或其他远程桌面方案。
+
+---
+
+## 访问控制
+
+这个服务能**用你已登录的浏览器发消息**，所以暴露它等于交出账号。反过来说，
+即使只监听 `127.0.0.1` 也不能自保——浏览器的同源策略按主机名判断，不按网络位置判断。
+恶意网页可以用 DNS rebinding 把域名解析到 `127.0.0.1`，之后它发出的请求在浏览器看来
+就是**同源**请求，连 CORS 都拦不住。
+
+因此默认开启三层防护（全部可在 `.env` 调整，见 `.env.example`）：
+
+| 层 | 默认行为 | 环境变量 |
+| --- | --- | --- |
+| Host 白名单 | 只放行 `localhost` / `127.0.0.1` / `::1`，其余返回 421 | `ALLOWED_HOSTS` |
+| CORS | **关闭**（仅同源） | `CORS_ORIGIN` |
+| Token | 不校验（纯 opt-in） | `BRIDGE_TOKEN` |
+
+配置 token：
+
+```bash
+# .env
+BRIDGE_TOKEN=<openssl rand -hex 24 的输出>
+```
+
+生效后 `/health` 和控制台页面仍然开放（否则健康检查和首次打开页面会直接不可用），
+其余接口都需要携带 token，三种方式任选：
+
+```bash
+curl -H "Authorization: Bearer $BRIDGE_TOKEN" http://127.0.0.1:3010/v1/chat/completions
+curl -H "x-bridge-token: $BRIDGE_TOKEN"      http://127.0.0.1:3010/v1/chat/completions
+# 控制台首次打开时用 ?token=xxx，token 会存进 sessionStorage，后续请求自动带上
+open "http://127.0.0.1:3010/?token=$BRIDGE_TOKEN"
+```
+
+**把服务暴露到 `127.0.0.1` 以外时，`BRIDGE_TOKEN` 必须设置**，
+并用 `ALLOWED_HOSTS` 显式列出允许的主机名。
 
 ---
 
