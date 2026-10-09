@@ -14,6 +14,13 @@ import {
   restoreMarkdownTokenPayloads,
   type ExtractedMarkdownTokenPayload,
 } from './markdown-restoration.js';
+import {
+  MIN_FALLBACK_RESPONSE_TEXT_LENGTH,
+  MIN_RESPONSE_TEXT_LENGTH,
+  hasResponseTextLength,
+  isPlaceholderArtifactText,
+} from './response-text.js';
+import { createGrokAccumulator, type ReducedStream, type LiveDelta } from '../stream-capture.js';
 
 const STABLE_POLLS_REQUIRED = 3;
 const POLL_INTERVAL_MS = 1200;
@@ -542,7 +549,17 @@ function extractRenderedMarkdownPayload(
 }
 
 export class ProviderClient {
-  constructor(private readonly providerId: ProviderId) {}
+  constructor(
+    private readonly providerId: ProviderId,
+    /**
+     * 真流捕获的取数入口，由 BrowserManager 注入。返回 undefined 表示这次没捕到，
+     * 上层会照旧走 DOM 轮询，功能不受影响。
+     */
+    private readonly streamSource?: {
+      take: (page: Page, since: number) => ReducedStream | undefined;
+      frames: (page: Page, since: number) => AsyncGenerator<string, void, void>;
+    },
+  ) {}
 
   private readonly toggleSettleTimeoutMs = 2200;
   private readonly sessionSelfCheckTimeoutMs = 5000;
@@ -565,6 +582,15 @@ export class ProviderClient {
       promptMode?: 'latest-user' | 'trailing-users' | 'full-messages';
       includeTrailingUserMessages?: boolean;
       injectSystemOnFirstTurn?: boolean;
+      /**
+       * 真流式出口：WebSocket 帧一到就回调，调用方可立刻转成 SSE delta 推给客户端。
+       * 只有 transport 为 websocket 的 provider 会走这条路——HTTP SSE 只能在生成
+       * 结束后一次性取到 body，做不到逐帧。
+       *
+       * 传了它就意味着**由这条流决定何时返回**，不再走 DOM 的"连续三轮稳定"启发式，
+       * 因为 WebSocket 的 response.done 是权威信号。
+       */
+      onDelta?: (delta: LiveDelta) => void;
     },
   ): Promise<ChatResult> {
     this.extractionDebugItems = [];
@@ -588,7 +614,26 @@ export class ProviderClient {
     }
     this.logPromptDebug(page, normalizedPrompt, options, prompt);
     await this.focusAndFill(page, provider, input, prompt);
+    const streamSentAt = Date.now();
     await this.submit(page, provider, input, existingResponseCount, page.url());
+
+    // 真流式：WebSocket 帧一到就往外推，拿到首字延迟。
+    // 仅当调用方要 delta、provider 是 websocket 传输、且确实配了 websocket 捕获时生效；
+    // 任何一步不满足就照旧走下面的 DOM 路径，功能不受影响。
+    if (options?.onDelta && provider.streamCapture?.transport === 'websocket') {
+      const live = await this.collectLiveDeltas(page, provider, streamSentAt, options.onDelta);
+      if (live) {
+        return {
+          provider: this.providerId,
+          url: page.url(),
+          capturedFromStream: true,
+          ...(live.reasoningContent ? { reasoningContent: live.reasoningContent } : {}),
+          ...(live.usage ? { usage: live.usage } : {}),
+          debug: { extraction: { items: [...this.extractionDebugItems] } },
+          content: live.content,
+        };
+      }
+    }
 
     const minimumResponseBlocks = 1;
     const responseTexts = await this.waitForStableResponses(
@@ -602,10 +647,43 @@ export class ProviderClient {
         fullPrompt: prompt,
       },
     );
+
+    // 真流优先。正文与思考内容由协议里的 phase 字段区分，不必再从 DOM 里猜哪个块
+    // 是答案（此前就因为抓错块把 DeepSeek 的思考过程当成了回复）。捕获不到就
+    // 照旧用 DOM 结果，功能不受影响。
+    // 真流优先，但**要等它到**。HTTP 流的 body 只能在响应结束后取到，而那条响应
+    // 往往比 DOM"稳定"更晚结束（实测 ChatGPT 的 finished() 要 11 秒）。不等的话
+    // 这里必然取不到，就静默退回 DOM——而 ChatGPT 的 DOM 里混着"思考/搜索网页"
+    // 这类按钮文字，于是抓出 `思考\n创建图像或贴纸…` 这种垃圾。
+    const captured = await this.awaitCapturedStream(page, streamSentAt);
+    if (captured?.content && !isPlaceholderArtifactText(captured.content)) {
+      this.extractionDebugItems.push({
+        index: 0,
+        method: 'html',
+        detail: `正文来自真流捕获（${captured.finished ? '站点已标记 finished' : '未等到 finished 帧'}），未从 DOM 推断`,
+        preview: captured.content.slice(0, 180),
+      });
+
+      return {
+        provider: this.providerId,
+        url: page.url(),
+        capturedFromStream: true,
+        ...(captured.reasoningContent ? { reasoningContent: captured.reasoningContent } : {}),
+        ...(captured.usage ? { usage: captured.usage } : {}),
+        debug: {
+          extraction: {
+            items: [...this.extractionDebugItems],
+          },
+        },
+        content: captured.content,
+      };
+    }
+
     const filteredResponseTexts = responseTexts.filter(
       (text) =>
         !this.isPromptEcho(text, normalizedPrompt.latestUserMessage, prompt) &&
-        !this.isProviderErrorText(text),
+        !this.isProviderErrorText(text) &&
+        !isPlaceholderArtifactText(text),
     );
     if (filteredResponseTexts.length === 0) {
       throw new Error(`未提取到 ${this.providerId} 的有效回复文本`);
@@ -656,7 +734,7 @@ export class ProviderClient {
     });
 
     const filteredResponseTexts = [resolvedText].filter(
-      (text) => text && !this.isProviderErrorText(text),
+      (text) => text && !this.isProviderErrorText(text) && !isPlaceholderArtifactText(text),
     );
     if (filteredResponseTexts.length === 0) {
       throw new Error(`未提取到 ${this.providerId} 的有效回复文本`);
@@ -757,6 +835,29 @@ export class ProviderClient {
   }
 
   private async findLatestVisibleResponseCandidate(locator: Locator): Promise<Locator | null> {
+    // 第一遍沿用原门槛，行为与改动前完全一致。
+    const primary = await this.findLatestVisibleResponseCandidateWithMinLength(
+      locator,
+      MIN_RESPONSE_TEXT_LENGTH,
+    );
+    if (primary) {
+      return primary;
+    }
+
+    // 第二遍放宽到"任何非空文本"。模型完全可能只回极短的内容
+    // （`[]`、`收到`、单个数字），旧实现只有一道8 字门槛，这些合法短答案
+    // 会被整段丢掉，最终报"未提取到有效回复文本"——而实际是提取成功了。
+    // 因为只在第一遍完全落空时才走到这里，所以不改变任何既有成功路径。
+    return this.findLatestVisibleResponseCandidateWithMinLength(
+      locator,
+      MIN_FALLBACK_RESPONSE_TEXT_LENGTH,
+    );
+  }
+
+  private async findLatestVisibleResponseCandidateWithMinLength(
+    locator: Locator,
+    minimumTextLength: number,
+  ): Promise<Locator | null> {
     const count = await locator.count().catch(() => 0);
     for (let index = count - 1; index >= 0; index -= 1) {
       const candidate = locator.nth(index);
@@ -773,11 +874,139 @@ export class ProviderClient {
       }
 
       const text = (await candidate.innerText().catch(() => '')).replace(/\s+/g, ' ').trim();
-      if (text.length >= 8) {
-        return candidate;
+      if (!hasResponseTextLength(text, minimumTextLength)) {
+        continue;
       }
+
+      // 某些站点给用户提问和 AI 回复**共用同一个 class**，只靠选择器区分不开。
+      // Grok 就是这样：`.response-content-markdown` 同时命中用户气泡和回复，
+      // "取最后一个"就可能取到用户自己刚发的那句话——于是接口原样返回提示词。
+      // 这里按 provider 配置的排除规则把用户消息剔掉。
+      if (await this.isUserMessage(candidate)) {
+        continue;
+      }
+
+      return candidate;
     }
     return null;
+  }
+
+  /**
+   * 判断某个候选块是不是"用户自己发的那条消息"。
+   *
+   * 判定方式：看它的祖先链上有没有用户消息独有的标记。
+   * 实测 Grok 的用户消息带 `data-testid="user-message"`，气泡还有
+   * `bg-surface-user-bubble`；AI 回复两者都没有。两个条件任一命中即判定为用户消息。
+   *
+   * 判定在页面里做（一次 evaluate），不逐个祖先发请求，避免 N 次往返。
+   */
+  private async isUserMessage(candidate: Locator): Promise<boolean> {
+    const selectors = getProvider(this.providerId).excludeUserMessageSelectors;
+    if (!selectors || selectors.length === 0) {
+      return false;
+    }
+    return candidate
+      .evaluate((node, rules) => rules.some((rule) => node.closest(rule) !== null), selectors)
+      .catch(() => false);
+  }
+
+  /**
+   * 边收 WebSocket 帧边往外推 delta。
+   *
+   * 返回 undefined 表示这条路不可用（没帧到达、或超时），调用方应退回 DOM 路径。
+   *
+   * 完成判定用的是帧里的权威 `response.done`，而不是 DOM 的"连续三轮内容不变"——
+   * 后者是为轮询设计的启发式，对流式通道既慢又不可靠。
+   */
+  private async collectLiveDeltas(
+    page: Page,
+    provider: ReturnType<typeof getProvider>,
+    since: number,
+    onDelta: (delta: LiveDelta) => void,
+  ): Promise<ReducedStream | undefined> {
+    const iterator = this.streamSource?.frames(page, since);
+    if (!iterator) {
+      return undefined;
+    }
+
+    const accumulator = createGrokAccumulator();
+    const hardLimit = provider.maxGenerationTimeoutMs ?? 600_000;
+    const giveUpAfter = 15_000;
+    const startedAt = Date.now();
+    let sawAnyFrame = false;
+
+    void (async () => {
+      for await (const frame of iterator) {
+        sawAnyFrame = true;
+        const delta = accumulator.push(frame);
+        if (delta.reasoningDelta || delta.contentDelta) {
+          onDelta(delta);
+        }
+        if (delta.finished) {
+          return;
+        }
+      }
+    })();
+
+    // 等权威完成信号；期间一旦开始出字就算这条路成立
+    for (;;) {
+      const snapshot = accumulator.snapshot();
+      if (snapshot.finished) {
+        // 等一小会儿收尾帧，然后**用完整归约的结果**而不是累加器快照。
+        // 实测踩过这个坑：Grok 的 response.done 可能早于最后几个内容帧到达，
+        // 一看到 done 就返回会把回答截断在半句。完整归约读的是同一批帧的全体，
+        // 已经被 reduceGrokStream 的测试覆盖过。
+        await page.waitForTimeout(600);
+        const complete = this.streamSource?.take(page, since);
+        return complete && complete.content ? complete : snapshot;
+      }
+      if (!sawAnyFrame && Date.now() - startedAt > giveUpAfter) {
+        return undefined;
+      }
+      if (Date.now() - startedAt > hardLimit) {
+        return sawAnyFrame ? accumulator.snapshot() : undefined;
+      }
+      await page.waitForTimeout(120);
+    }
+  }
+
+  /**
+   * 等真流捕获的结果就绪。
+   *
+   * HTTP 传输的流只能在请求结束后一次性取到 body，所以**这个等待不是可有可无的**：
+   * 实测 ChatGPT 的 `response.finished()` 要 11 秒才resolve，而 DOM"稳定"往往
+   * 更早判定。不等就取不到，只能退回 DOM 路径——而 ChatGPT 的 DOM 里混着
+   * "思考 / 搜索网页"这类按钮文字，会抓出 `思考\n创建图像或贴纸…` 这种垃圾。
+   *
+   * WebSocket 传输的帧是实时到达的，这里第一次就能拿到，循环立刻退出。
+   *
+   * 一旦取到内容就返回；到点还没��就交回undefined，让上层照旧走 DOM，
+   * 功能不受影响，只是答案可能不如协议可靠。
+   */
+  private async awaitCapturedStream(
+    page: Page,
+    since: number,
+    timeoutMs = 18_000,
+  ): Promise<ReturnType<NonNullable<typeof this.streamSource>['take']>> {
+    const startedAt = Date.now();
+    let last: ReturnType<NonNullable<typeof this.streamSource>['take']>;
+    for (;;) {
+      const captured = this.streamSource?.take(page, since);
+      if (captured?.content) {
+        last = captured;
+        // **拿到内容不等于拿到完整内容。** HTTP 的 body 只有响应结束后才完整，
+        // 而在此之前可能已经读到一部分——实测 ChatGPT 会在半途就 resolve，
+        // 于是正文只剩「皑」这种半个字。
+        // 所以必须等到站点自己说"这一轮结束了"（finished），或者超时。
+        if (captured.finished) {
+          return captured;
+        }
+      }
+      if (Date.now() - startedAt >= timeoutMs) {
+        return last;
+      }
+      await page.waitForTimeout(250);
+    }
   }
 
   private async isQwenFinalAnswerCandidate(candidate: Locator): Promise<boolean> {
@@ -1203,8 +1432,15 @@ export class ProviderClient {
     input: Locator,
     prompt: string,
   ): Promise<void> {
-    const avoidKeyboardTypeFallback =
-      prompt.includes('\n') && this.providerMaySubmitOnEnter(provider);
+    // 提示词里有换行时，绝不能用 type() 兜底：它逐字符发按键，'\n' 会变成一次
+    // Enter，多数 composer 收到 Enter 就直接提交，于是半截提示词被发出去。
+    //
+    // 这里刻意不再按 provider 判断。"submitWithEnterFallback: false" 说的是
+    // *这个桥* 不用回车去提交，并不代表*目标网站*的回车键是安全的——曾因此
+    // 让 grok 落在无防护区（grok 的 composer 遇 Enter 确实会提交）。
+    // 只要没有换行，type() 就不可能产生 Enter，因此可以安全使用；
+    // 有换行时 DOM 注入兜底严格更安全，不存在需要 type() 的场景。
+    const avoidKeyboardTypeFallback = prompt.includes('\n');
 
     try {
       await input.click({ timeout: 2000 }).catch(() => undefined);
@@ -1298,18 +1534,6 @@ export class ProviderClient {
         `未能稳定写入 textarea/input（当前观测值: ${latestObservedValue.slice(0, 120) || '<empty>'}）`,
       );
     }
-  }
-
-  private providerMaySubmitOnEnter(provider: ProviderConfig): boolean {
-    if (this.providerId === 'qwen' || this.providerId === 'deepseek') {
-      return true;
-    }
-
-    if (provider.submitWithEnterFallback !== false) {
-      return true;
-    }
-
-    return Boolean(provider.keyboardSubmitShortcuts?.includes('Enter'));
   }
 
   private async fillContentEditable(page: Page, input: Locator, prompt: string): Promise<void> {
@@ -1649,15 +1873,39 @@ export class ProviderClient {
     }
   }
 
+  /**
+   * 统计"回复块"的个数。
+   *
+   * 必须排除用户消息：Grok 的用户提问和 AI 回复共用 `.response-content-markdown`，
+   * 不排除的话发一条消息计数就 +1，而真正的回复出现时再 +1——于是"回复数 > 发送前"
+   * 这个完成条件会在用户消息一出现时就成立，拿到的是刚发出去的那句话。
+   */
   private async countResponses(page: Page, provider: ProviderConfig): Promise<number> {
     let best = 0;
 
     for (const selector of provider.responseSelectors) {
-      const count = await page.locator(selector).count();
+      const count = await this.countMatchingResponses(page, selector);
       best = Math.max(best, count);
     }
 
     return best;
+  }
+
+  /** 只数"不是用户消息"的匹配元素。 */
+  private async countMatchingResponses(page: Page, selector: string): Promise<number> {
+    const exclude = getProvider(this.providerId).excludeUserMessageSelectors;
+    if (!exclude || exclude.length === 0) {
+      return page.locator(selector).count();
+    }
+
+    return page
+      .locator(selector)
+      .evaluateAll(
+        (nodes, rules) =>
+          nodes.filter((node) => !rules.some((rule) => node.closest(rule) !== null)).length,
+        exclude,
+      )
+      .catch(() => page.locator(selector).count());
   }
 
   private async getResponseCountsBySelector(
@@ -1667,10 +1915,7 @@ export class ProviderClient {
     const counts: Record<string, number> = {};
 
     for (const selector of provider.responseSelectors) {
-      counts[selector] = await page
-        .locator(selector)
-        .count()
-        .catch(() => 0);
+      counts[selector] = await this.countMatchingResponses(page, selector).catch(() => 0);
     }
 
     return counts;
@@ -1753,7 +1998,7 @@ export class ProviderClient {
           this.containsQuotaErrorContent(texts)
         ) {
           throw new Error(
-            `${this.providerId} 当前会话已达到额度或频率限制，请切换会话、升级额度或稍后再试；如果这是登录、风控、额度或网络问题，请查看已置前的浏览器页签并手动处理。`,
+            `${this.providerId} 当前会话已达到额度或频率限制，请切换会话、升级额度或稍后再试；如果这是登录、风控、额度或网络问题，请在控制台的「会话管理」里打开该 provider 的页面手动处理。`,
           );
         }
 
@@ -1885,7 +2130,7 @@ export class ProviderClient {
     ];
     const matchedChoiceHint = choiceHints.find((hint) => normalizedBody.includes(hint));
     if (matchedChoiceHint) {
-      return `${this.providerId} 当前页面要求先手动选择候选回答，已暂停自动发送，请查看已置前页签后再继续`;
+      return `${this.providerId} 当前页面要求先手动选择候选回答，已暂停自动发送，请在控制台的「会话管理」里打开该 provider 页面后再继续`;
     }
 
     const quotaHints = [
@@ -1946,7 +2191,7 @@ export class ProviderClient {
     const currentUrl = page.url().toLowerCase();
     const likelyAuthUrl = /(login|signin|auth|passport|accounts?\.)/.test(currentUrl);
     if ((!visibleInput && matchedAuthHint) || (likelyAuthUrl && !visibleInput)) {
-      return `${this.providerId} 当前页面需要重新登录，请查看已置前页签并手动完成登录`;
+      return `${this.providerId} 当前页面需要重新登录，请在控制台的「会话管理」里打开该 provider 页面完成登录`;
     }
 
     return undefined;
@@ -3983,7 +4228,11 @@ export class ProviderClient {
         return false;
       }
 
-      return !this.isProviderErrorText(text) && !this.isTransientProviderText(text);
+      return (
+        !this.isProviderErrorText(text) &&
+        !this.isTransientProviderText(text) &&
+        !isPlaceholderArtifactText(text)
+      );
     });
   }
 

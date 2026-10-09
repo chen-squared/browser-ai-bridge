@@ -1,4 +1,5 @@
 import path from 'node:path';
+import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import express from 'express';
 import cors from 'cors';
@@ -7,9 +8,10 @@ import { appConfig } from './config.js';
 import { BrowserManager } from './browser/browser-manager.js';
 import { ProviderClient } from './browser/provider-client.js';
 import { normalizeMessages } from './prompt.js';
+import { createSyncPlan } from './session-sync.js';
+import { buildChatCompletionChunks } from './sse-chunks.js';
+import { buildAllowedHosts, extractToken, isAllowedHost, isTokenValid } from './http-access.js';
 import {
-  buildMeetingHintMapScript,
-  buildMeetingOptionsHtml,
   listMeetingModels,
   resolveMeetingPlan,
   resolveMeetingTemplate,
@@ -22,35 +24,6 @@ import {
   reloadProviders,
 } from './providers/registry.js';
 import type { ChatMessage, ProviderId } from './types.js';
-
-type NonSystemMessage = { role: 'user' | 'assistant'; content: string; name?: string };
-
-type SyncPlan = {
-  mode: 'fresh' | 'append' | 'rebuild';
-  effectiveMessages: Array<{
-    role: 'system' | 'user' | 'assistant';
-    content: string;
-    name?: string;
-  }>;
-  effectivePromptMode: 'latest-user' | 'trailing-users' | 'full-messages';
-  injectSystemOnFirstTurn: boolean;
-  cachedMessages: NonSystemMessage[];
-  nextCachedMessages: NonSystemMessage[];
-  debug: {
-    reason:
-      | 'no-existing-session'
-      | 'empty-cache-with-existing-session'
-      | 'strict-append'
-      | 'context-window-append'
-      | 'append-blocked-by-assistant-delta'
-      | 'context-diverged';
-    matchedPrefixCount: number;
-    divergenceIndex: number | null;
-    deltaCount: number;
-    containsSyntheticAssistant: boolean;
-    transcriptMode: 'raw' | 'context-window';
-  };
-};
 
 const providerSchema = z.enum(['chatgpt', 'gemini', 'claude', 'grok', 'qwen', 'deepseek']);
 
@@ -81,12 +54,32 @@ const requestSchema = z.object({
       participants: z
         .array(z.enum(['chatgpt', 'gemini', 'claude', 'grok', 'qwen', 'deepseek']))
         .min(2)
-        .max(4)
+        // 上限 6：六家 provider 全选也只是再多一个会话。
+        // 原先限制 4，但注册表里恰好六个 provider，界面上会出现
+        // 「有 provider 却选不进来」的荒唐状态。
+        .max(6)
         .optional(),
       rounds: z.number().int().min(1).max(4).optional(),
       summarizer: z.enum(['chatgpt', 'gemini', 'claude', 'grok', 'qwen', 'deepseek']).optional(),
+      /**
+       * 总结者复用哪个参与者席位（形如 deepseek1 / deepseek2）。
+       * 留空 = 开新会话。这是"复用之前的会话"与"开新的会话"的唯一开关。
+       */
+      summarizerSeat: z.string().min(1).max(32).optional(),
     })
     .optional(),
+});
+
+/** `/meeting/plan` 的入参：只要编排相关的字段，其余一律不接受。 */
+const meetingPlanSchema = z.object({
+  template: z.string().min(1),
+  participants: z
+    .array(z.enum(['chatgpt', 'gemini', 'claude', 'grok', 'qwen', 'deepseek']))
+    .max(6)
+    .optional(),
+  summarizer: z.enum(['chatgpt', 'gemini', 'claude', 'grok', 'qwen', 'deepseek']).optional(),
+  summarizerSeat: z.string().min(1).max(32).optional(),
+  rounds: z.number().int().min(1).max(4).optional(),
 });
 
 type CompletionPayload = z.infer<typeof requestSchema>;
@@ -113,6 +106,13 @@ async function completeWithProvider(
     messages: ChatMessage[];
     conversationId?: string;
   },
+  /**
+   * 真流式出口。只有当 provider 走 WebSocket 传输且调用方要求 stream 时才会被触发
+   * （HTTP SSE 的流只能在生成结束后一次性取到 body，做不到逐帧推送）。
+   */
+  options?: {
+    onDelta?: (delta: { contentDelta?: string; reasoningDelta?: string }) => void;
+  },
 ): Promise<{
   provider: ProviderId;
   model: string;
@@ -120,6 +120,13 @@ async function completeWithProvider(
   url?: string;
   content?: string;
   reasoningContent?: string;
+  usage?: {
+    prompt_tokens: number;
+    completion_tokens: number;
+    total_tokens: number;
+    reasoning_tokens?: number;
+  };
+  capturedFromStream?: boolean;
   dryRun?: boolean;
   prompt?: string;
   debug?: unknown;
@@ -133,7 +140,10 @@ async function completeWithProvider(
     throw new Error('至少需要一条 user 消息');
   }
 
-  const client = new ProviderClient(provider);
+  const client = new ProviderClient(provider, {
+    take: (page, since) => browserManager.takeCapturedStream(page, provider, since),
+    frames: (page, since) => browserManager.streamFrames(page, provider, since),
+  });
   const hasExistingSession = browserManager.hasSession(provider, payload.conversationId);
   const desiredPromptMode = resolvePromptMode(payload);
   const cachedMessages = browserManager.getSyncedMessages(provider, payload.conversationId);
@@ -196,6 +206,7 @@ async function completeWithProvider(
     async (page) => {
       try {
         return await client.sendMessage(page, effectiveNormalizedPrompt, {
+          onDelta: options?.onDelta,
           isContinuation: useContinuationMode,
           enableSearch: payload.enableSearch,
           enableReasoning: payload.enableReasoning,
@@ -230,13 +241,23 @@ async function completeWithProvider(
     { role: 'assistant', content: content.content },
   ]);
 
+  // 调用方没传 conversationId 时，从页面 URL 里抽真实会话 id 回传。
+  // 有了它，调用方下一次带上这个 id 就等于"继续这条对话"，bridge 会复用
+  // 同一个标签页；不带 id 则表示"开新对话"，bridge 新建标签页并导航到新对话页。
+  // 这样"是否连续"由调用方显式决定，而不需要 bridge 靠启发式去猜。
+  const resolvedConversationId =
+    payload.conversationId ??
+    browserManager.recordDetectedConversationId(provider, payload.conversationId);
+
   return {
     provider,
     model: payload.model,
-    conversationId: payload.conversationId,
+    conversationId: resolvedConversationId,
     url: content.url,
     content: content.content,
     reasoningContent: content.reasoningContent,
+    ...(content.usage ? { usage: content.usage } : {}),
+    ...(content.capturedFromStream ? { capturedFromStream: true } : {}),
     debug: content.debug,
   };
 }
@@ -245,8 +266,80 @@ const browserManager = new BrowserManager();
 const app = express();
 const runtimeDir = path.dirname(fileURLToPath(import.meta.url));
 const markedVendorDir = path.resolve(runtimeDir, '../node_modules/marked/lib');
+const consoleHtmlPath = path.resolve(runtimeDir, 'console/index.html');
+const CONSOLE_HTML = readFileSync(consoleHtmlPath, 'utf8');
 
-app.use(cors());
+// 1) Host 白名单：防 DNS rebinding。
+//    只监听 127.0.0.1 并不能自保——浏览器按主机名判断同源，恶意域名解析到
+//    127.0.0.1 之后，请求对浏览器而言是同源的，CORS 也拦不住。这是先决关卡，
+//    任何情况下都启用。
+const allowedHosts = buildAllowedHosts(appConfig.allowedHosts, appConfig.host);
+app.use((req, res, next) => {
+  if (!isAllowedHost(req.headers.host, allowedHosts)) {
+    res.status(421).json({
+      error: {
+        message:
+          `Host ${req.headers.host ?? '<缺失>'} 不在允许列表内。` +
+          '这是为防止 DNS rebinding 攻击；如需从其他主机名访问，请设置 ALLOWED_HOSTS。',
+      },
+    });
+    return;
+  }
+  next();
+});
+
+// 2) CORS：默认关闭（= 仅同源）。之前是 cors() 全开，任何网页都能读走响应，
+//    甚至用你的登录态驱动这个浏览器发消息。
+const corsOrigin = appConfig.corsOrigin?.trim();
+if (corsOrigin) {
+  const allowedOrigins = new Set(
+    corsOrigin
+      .split(',')
+      .map((origin) => origin.trim())
+      .filter(Boolean),
+  );
+  app.use(
+    cors({
+      origin(origin, callback) {
+        if (!origin || allowedOrigins.has(origin)) {
+          callback(null, true);
+          return;
+        }
+        callback(new Error(`CORS origin 不被允许: ${origin}`));
+      },
+    }),
+  );
+}
+
+// 3) 可选 token：未配置时完全不影响现有行为。
+//    /health 和控制台本体放行，否则健康检查和首次打开页面会直接不可用。
+if (appConfig.bridgeToken) {
+  const isPublicPath = (pathname: string) =>
+    pathname === '/health' || pathname === '/' || pathname.startsWith('/vendor/');
+
+  app.use((req, res, next) => {
+    if (isPublicPath(req.path)) {
+      next();
+      return;
+    }
+
+    const providedToken = extractToken(
+      req.headers.authorization,
+      req.headers['x-bridge-token'] as string | undefined,
+      typeof req.query.token === 'string' ? req.query.token : undefined,
+    );
+
+    if (!isTokenValid(providedToken, appConfig.bridgeToken)) {
+      res.status(401).json({
+        error: { message: '缺少或错误的 BRIDGE_TOKEN，请通过 Authorization: Bearer 传入。' },
+      });
+      return;
+    }
+
+    next();
+  });
+}
+
 app.use(express.json({ limit: '1mb' }));
 app.use('/vendor/marked', express.static(markedVendorDir));
 
@@ -319,6 +412,13 @@ async function revealRelevantSessionOnError(
   payload: Partial<CompletionPayload>,
   effectiveMeetingConversationId?: string,
 ): Promise<void> {
+  // 默认不做。bringToFront 会激活标签页，在 macOS 上连带激活整个浏览器窗口；
+  // 而错误并不罕见（未登录时的 90 秒超时就是典型），等于频繁打断同一台机器上的
+  // 其他操作。卡住时想看一眼，用控制台的"打开"按钮即可（那条路径不受此开关影响）。
+  if (!appConfig.revealOnError) {
+    return;
+  }
+
   const meetingTemplate = resolveMeetingTemplate(payload.model);
   if (meetingTemplate) {
     const baseConversationId =
@@ -386,1612 +486,8 @@ function resolvePromptMode(
   return 'trailing-users';
 }
 
-function messagesEqual(left: NonSystemMessage, right: NonSystemMessage): boolean {
-  if (left.role !== right.role || left.content !== right.content) {
-    return false;
-  }
-
-  if (left.role === 'assistant' && right.role === 'assistant') {
-    return true;
-  }
-
-  return (left.name ?? '') === (right.name ?? '');
-}
-
-function isPrefix(prefix: NonSystemMessage[], all: NonSystemMessage[]): boolean {
-  if (prefix.length > all.length) {
-    return false;
-  }
-
-  return prefix.every((message, index) => messagesEqual(message, all[index]));
-}
-
-function getDivergenceIndex(left: NonSystemMessage[], right: NonSystemMessage[]): number | null {
-  const commonLength = Math.min(left.length, right.length);
-  for (let index = 0; index < commonLength; index += 1) {
-    if (!messagesEqual(left[index], right[index])) {
-      return index;
-    }
-  }
-
-  return left.length === right.length ? null : commonLength;
-}
-
-function getSubsequenceMatchIndexes(
-  sequence: NonSystemMessage[],
-  target: NonSystemMessage[],
-): number[] | null {
-  if (sequence.length > target.length) {
-    return null;
-  }
-
-  const matchedIndexes: number[] = [];
-  let sequenceIndex = 0;
-
-  for (
-    let targetIndex = 0;
-    targetIndex < target.length && sequenceIndex < sequence.length;
-    targetIndex += 1
-  ) {
-    if (messagesEqual(sequence[sequenceIndex], target[targetIndex])) {
-      matchedIndexes.push(targetIndex);
-      sequenceIndex += 1;
-    }
-  }
-
-  return sequenceIndex === sequence.length ? matchedIndexes : null;
-}
-
-function buildEffectiveMessages(
-  system: string | undefined,
-  nonSystemMessages: NonSystemMessage[],
-): SyncPlan['effectiveMessages'] {
-  const messages: SyncPlan['effectiveMessages'] = [];
-  if (system) {
-    messages.push({ role: 'system', content: system });
-  }
-  messages.push(...nonSystemMessages);
-  return messages;
-}
-
-function createSyncPlan(args: {
-  system?: string;
-  currentMessages: NonSystemMessage[];
-  currentContextMessages: NonSystemMessage[];
-  latestUserMessage: NonSystemMessage;
-  cachedMessages: NonSystemMessage[];
-  hasExistingSession: boolean;
-  desiredPromptMode: 'latest-user' | 'trailing-users' | 'full-messages';
-  injectSystemOnFirstTurn: boolean;
-  transcriptMode: 'raw' | 'context-window';
-}): SyncPlan {
-  const {
-    system,
-    currentMessages,
-    currentContextMessages,
-    latestUserMessage,
-    cachedMessages,
-    hasExistingSession,
-    desiredPromptMode,
-    injectSystemOnFirstTurn,
-    transcriptMode,
-  } = args;
-
-  const appendDeltaMessages =
-    transcriptMode === 'context-window'
-      ? [...currentContextMessages.slice(cachedMessages.length), latestUserMessage]
-      : currentMessages.slice(cachedMessages.length);
-  const rebuildNextCachedMessages =
-    transcriptMode === 'context-window' ? currentContextMessages : currentMessages;
-
-  if (!hasExistingSession) {
-    return {
-      mode: 'fresh',
-      effectiveMessages: buildEffectiveMessages(system, currentMessages),
-      effectivePromptMode: desiredPromptMode,
-      injectSystemOnFirstTurn,
-      cachedMessages,
-      nextCachedMessages: rebuildNextCachedMessages,
-      debug: {
-        reason: 'no-existing-session',
-        matchedPrefixCount: 0,
-        divergenceIndex: null,
-        deltaCount: currentMessages.length,
-        containsSyntheticAssistant: currentMessages.some((message) => message.role === 'assistant'),
-        transcriptMode,
-      },
-    };
-  }
-
-  if (cachedMessages.length === 0) {
-    return {
-      mode: 'rebuild',
-      effectiveMessages: buildEffectiveMessages(system, currentMessages),
-      effectivePromptMode: desiredPromptMode,
-      injectSystemOnFirstTurn: Boolean(system),
-      cachedMessages,
-      nextCachedMessages: rebuildNextCachedMessages,
-      debug: {
-        reason: 'empty-cache-with-existing-session',
-        matchedPrefixCount: 0,
-        divergenceIndex: 0,
-        deltaCount: currentMessages.length,
-        containsSyntheticAssistant: currentMessages.some((message) => message.role === 'assistant'),
-        transcriptMode,
-      },
-    };
-  }
-
-  const comparisonMessages =
-    transcriptMode === 'context-window' ? currentContextMessages : currentMessages;
-  const matchedIndexes =
-    transcriptMode === 'context-window'
-      ? getSubsequenceMatchIndexes(cachedMessages, comparisonMessages)
-      : isPrefix(cachedMessages, comparisonMessages)
-        ? cachedMessages.map((_message, index) => index)
-        : null;
-
-  if (matchedIndexes) {
-    const matchedIndexSet = new Set(matchedIndexes);
-    const deltaMessages =
-      transcriptMode === 'context-window'
-        ? [
-            ...comparisonMessages.filter((_message, index) => !matchedIndexSet.has(index)),
-            latestUserMessage,
-          ]
-        : appendDeltaMessages;
-    const containsSyntheticAssistant = deltaMessages.some(
-      (message) => message.role === 'assistant',
-    );
-    const canAppendDelta =
-      deltaMessages.length > 0 &&
-      (transcriptMode === 'context-window' || !containsSyntheticAssistant);
-
-    if (canAppendDelta) {
-      return {
-        mode: 'append',
-        effectiveMessages: buildEffectiveMessages(undefined, deltaMessages),
-        effectivePromptMode: 'trailing-users',
-        injectSystemOnFirstTurn: false,
-        cachedMessages,
-        nextCachedMessages: rebuildNextCachedMessages,
-        debug: {
-          reason: transcriptMode === 'context-window' ? 'context-window-append' : 'strict-append',
-          matchedPrefixCount: cachedMessages.length,
-          divergenceIndex: null,
-          deltaCount: deltaMessages.length,
-          containsSyntheticAssistant,
-          transcriptMode,
-        },
-      };
-    }
-
-    return {
-      mode: 'rebuild',
-      effectiveMessages: buildEffectiveMessages(system, currentMessages),
-      effectivePromptMode: desiredPromptMode,
-      injectSystemOnFirstTurn: Boolean(system),
-      cachedMessages,
-      nextCachedMessages: rebuildNextCachedMessages,
-      debug: {
-        reason: 'append-blocked-by-assistant-delta',
-        matchedPrefixCount: cachedMessages.length,
-        divergenceIndex: null,
-        deltaCount: deltaMessages.length,
-        containsSyntheticAssistant,
-        transcriptMode,
-      },
-    };
-  }
-
-  const divergenceIndex = getDivergenceIndex(cachedMessages, comparisonMessages);
-
-  return {
-    mode: 'rebuild',
-    effectiveMessages: buildEffectiveMessages(system, currentMessages),
-    effectivePromptMode: desiredPromptMode,
-    injectSystemOnFirstTurn: Boolean(system),
-    cachedMessages,
-    nextCachedMessages: rebuildNextCachedMessages,
-    debug: {
-      reason: 'context-diverged',
-      matchedPrefixCount:
-        divergenceIndex ?? Math.min(cachedMessages.length, comparisonMessages.length),
-      divergenceIndex,
-      deltaCount: Math.max(0, comparisonMessages.length - cachedMessages.length),
-      containsSyntheticAssistant: currentMessages.some((message) => message.role === 'assistant'),
-      transcriptMode,
-    },
-  };
-}
-
 app.get('/', (_req, res) => {
-  res.type('html').send(`<!doctype html>
-<html lang="zh-CN">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>browser-ai-bridge</title>
-  <style>
-    :root {
-      color-scheme: light;
-      --bg: #f4efe5;
-      --bg-2: #efe6d6;
-      --panel: rgba(255, 252, 245, 0.86);
-      --ink: #16181a;
-      --muted: #596063;
-      --line: rgba(126, 105, 78, 0.25);
-      --accent: #0f766e;
-      --accent-2: #b45309;
-      --accent-3: #1d4ed8;
-      --warn: #9a3412;
-      --ok: #166534;
-      --danger: #991b1b;
-      --shadow: 0 24px 60px rgba(56, 43, 24, 0.10);
-    }
-    body {
-      margin: 0;
-      font-family: "Iowan Old Style", "Palatino Linotype", "Book Antiqua", Georgia, serif;
-      background:
-        radial-gradient(circle at top left, rgba(255, 247, 223, 0.95), transparent 34%),
-        radial-gradient(circle at top right, rgba(191, 219, 254, 0.45), transparent 28%),
-        linear-gradient(180deg, var(--bg-2), var(--bg));
-      color: var(--ink);
-    }
-    main {
-      max-width: 1120px;
-      margin: 0 auto;
-      padding: 36px 20px 72px;
-    }
-    h1 {
-      margin: 0;
-      font-size: 48px;
-      letter-spacing: -0.03em;
-    }
-    h2 {
-      margin: 0 0 10px;
-      font-size: 28px;
-    }
-    h3 {
-      margin: 0 0 10px;
-      font-size: 20px;
-    }
-    p, li {
-      font-size: 18px;
-      line-height: 1.6;
-      color: var(--muted);
-    }
-    .hero {
-      display: grid;
-      gap: 14px;
-      padding: 28px;
-      border-radius: 28px;
-      background:
-        linear-gradient(135deg, rgba(255,255,255,0.72), rgba(255,250,240,0.62)),
-        radial-gradient(circle at top right, rgba(13, 148, 136, 0.14), transparent 30%);
-      border: 1px solid var(--line);
-      box-shadow: var(--shadow);
-      backdrop-filter: blur(12px);
-    }
-    .hero p {
-      margin: 0;
-      max-width: 820px;
-    }
-    .panel {
-      background: var(--panel);
-      border: 1px solid var(--line);
-      border-radius: 22px;
-      padding: 22px;
-      margin-top: 18px;
-      box-shadow: var(--shadow);
-      backdrop-filter: blur(12px);
-    }
-    .grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
-      gap: 18px;
-      margin-top: 18px;
-    }
-    code, pre {
-      font-family: "SFMono-Regular", Menlo, Consolas, monospace;
-      font-size: 14px;
-    }
-    pre {
-      overflow: auto;
-      background: #f5efe1;
-      border-radius: 12px;
-      padding: 14px;
-      border: 1px solid var(--line);
-    }
-    .actions {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 12px;
-      margin-top: 14px;
-    }
-    button, .button {
-      border-radius: 999px;
-      padding: 11px 17px;
-      font-weight: 700;
-      color: white;
-      background: linear-gradient(180deg, color-mix(in srgb, var(--accent) 88%, white), var(--accent));
-      border: 0;
-      cursor: pointer;
-      text-decoration: none;
-      box-shadow: 0 8px 18px rgba(15, 118, 110, 0.22);
-    }
-    button.secondary, .button.secondary {
-      background: linear-gradient(180deg, color-mix(in srgb, var(--accent-2) 88%, white), var(--accent-2));
-      box-shadow: 0 8px 18px rgba(180, 83, 9, 0.18);
-    }
-    button.tertiary, .button.tertiary {
-      background: linear-gradient(180deg, color-mix(in srgb, var(--accent-3) 88%, white), var(--accent-3));
-      box-shadow: 0 8px 18px rgba(29, 78, 216, 0.18);
-    }
-    button:disabled {
-      opacity: 0.55;
-      cursor: wait;
-    }
-    .stack {
-      display: grid;
-      gap: 12px;
-    }
-    label {
-      display: grid;
-      gap: 8px;
-      font-size: 15px;
-      color: var(--muted);
-      font-weight: 700;
-    }
-    textarea, input, select {
-      width: 100%;
-      box-sizing: border-box;
-      border-radius: 12px;
-      border: 1px solid var(--line);
-      background: rgba(255,255,255,0.78);
-      padding: 12px 14px;
-      font: inherit;
-      color: var(--ink);
-    }
-    textarea {
-      min-height: 120px;
-      resize: vertical;
-    }
-    .status {
-      border-left: 5px solid var(--accent-3);
-      padding: 12px 14px;
-      border-radius: 10px;
-      background: rgba(37, 81, 122, 0.08);
-      color: var(--ink);
-      font-size: 16px;
-      line-height: 1.5;
-    }
-    .status.ok {
-      border-left-color: var(--ok);
-      background: rgba(37, 89, 61, 0.09);
-    }
-    .status.warn {
-      border-left-color: var(--warn);
-      background: rgba(141, 75, 31, 0.1);
-    }
-    .status.error {
-      border-left-color: var(--danger);
-      background: rgba(138, 47, 47, 0.09);
-    }
-    .meta {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-      gap: 10px;
-      margin-top: 12px;
-    }
-    .pill {
-      border-radius: 999px;
-      padding: 7px 12px;
-      font-size: 13px;
-      font-weight: 700;
-      background: rgba(255,255,255,0.65);
-      border: 1px solid var(--line);
-      color: var(--ink);
-      display: inline-flex;
-      align-items: center;
-      gap: 8px;
-    }
-    .small {
-      font-size: 14px;
-      color: var(--muted);
-    }
-    .meeting-app {
-      display: grid;
-      grid-template-columns: 280px minmax(0, 1fr);
-      gap: 18px;
-      align-items: stretch;
-    }
-    .meeting-sidebar {
-      display: grid;
-      gap: 14px;
-      align-content: start;
-    }
-    .meeting-chat-panel {
-      display: grid;
-      grid-template-rows: auto 1fr auto;
-      min-height: 760px;
-      overflow: hidden;
-      padding: 0;
-    }
-    .meeting-chat-header {
-      padding: 20px 22px 16px;
-      border-bottom: 1px solid rgba(126, 105, 78, 0.14);
-      background: linear-gradient(180deg, rgba(255,255,255,0.78), rgba(255,252,245,0.6));
-    }
-    .meeting-chat-header p {
-      margin: 8px 0 0;
-      font-size: 14px;
-    }
-    .meeting-chat-scroll {
-      padding: 26px 22px;
-      overflow-y: auto;
-      display: flex;
-      flex-direction: column;
-      gap: 18px;
-      background:
-        radial-gradient(circle at top left, rgba(255,255,255,0.9), transparent 34%),
-        linear-gradient(180deg, rgba(248, 244, 236, 0.45), rgba(255, 255, 255, 0.82));
-    }
-    .meeting-bubble-row {
-      display: flex;
-      gap: 12px;
-      align-items: flex-end;
-    }
-    .meeting-bubble-row.user {
-      justify-content: flex-end;
-      flex-direction: row-reverse;
-    }
-    .meeting-bubble-row.assistant {
-      justify-content: flex-start;
-    }
-    .meeting-avatar {
-      width: 34px;
-      height: 34px;
-      border-radius: 999px;
-      flex: 0 0 34px;
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      font: 700 11px/1 "SF Pro Display", "Helvetica Neue", Arial, sans-serif;
-      letter-spacing: 0.08em;
-      box-shadow: 0 8px 18px rgba(37, 31, 22, 0.10);
-    }
-    .meeting-avatar.user {
-      background: linear-gradient(180deg, #0f172a, #1e293b);
-      color: #f8fafc;
-    }
-    .meeting-avatar.assistant {
-      background: linear-gradient(180deg, #fff, #e8edf4);
-      border: 1px solid rgba(126, 105, 78, 0.16);
-      color: #111827;
-    }
-    .meeting-bubble-stack {
-      max-width: min(78%, 740px);
-      display: grid;
-      gap: 7px;
-    }
-    .meeting-bubble-row.user .meeting-bubble-stack {
-      margin-left: auto;
-      justify-items: end;
-      text-align: right;
-    }
-    .meeting-bubble-row.assistant .meeting-bubble-stack {
-      margin-right: auto;
-      justify-items: start;
-      text-align: left;
-    }
-    .meeting-bubble-meta {
-      display: flex;
-      gap: 8px;
-      align-items: center;
-      font: 600 12px/1.4 "SF Pro Text", "Helvetica Neue", Arial, sans-serif;
-      color: #6b7280;
-      padding: 0 4px;
-    }
-    .meeting-bubble {
-      border-radius: 22px;
-      padding: 15px 17px;
-      border: 1px solid rgba(126, 105, 78, 0.14);
-      box-shadow: 0 16px 34px rgba(56, 43, 24, 0.08);
-      font-size: 15px;
-      line-height: 1.74;
-      overflow-wrap: anywhere;
-    }
-    .meeting-bubble-row.user .meeting-bubble {
-      background: linear-gradient(180deg, #1f2937, #111827);
-      color: #f9fafb;
-      border-bottom-right-radius: 8px;
-      border-color: rgba(17, 24, 39, 0.8);
-    }
-    .meeting-bubble-row.assistant .meeting-bubble {
-      background: linear-gradient(180deg, #ffffff, #f8fafc);
-      color: #111827;
-      border-bottom-left-radius: 8px;
-    }
-    .meeting-reasoning {
-      width: 100%;
-      border: 1px solid rgba(126, 105, 78, 0.14);
-      border-radius: 16px;
-      background: rgba(255, 251, 245, 0.86);
-      overflow: hidden;
-    }
-    .meeting-reasoning summary {
-      cursor: pointer;
-      list-style: none;
-      padding: 12px 14px;
-      font: 600 13px/1.4 "SF Pro Text", "Helvetica Neue", Arial, sans-serif;
-      color: #5b4630;
-      user-select: none;
-    }
-    .meeting-reasoning summary::-webkit-details-marker {
-      display: none;
-    }
-    .meeting-reasoning summary::after {
-      content: '展开';
-      float: right;
-      color: #8b7355;
-      font-weight: 500;
-    }
-    .meeting-reasoning[open] summary::after {
-      content: '收起';
-    }
-    .meeting-reasoning-body {
-      display: grid;
-      gap: 10px;
-      padding: 0 14px 14px;
-      border-top: 1px solid rgba(126, 105, 78, 0.1);
-      background: linear-gradient(180deg, rgba(255,255,255,0.72), rgba(250,245,236,0.82));
-    }
-    .meeting-reasoning-entry {
-      display: grid;
-      gap: 6px;
-      padding: 12px 0 0;
-    }
-    .meeting-reasoning-entry + .meeting-reasoning-entry {
-      border-top: 1px dashed rgba(126, 105, 78, 0.16);
-    }
-    .meeting-reasoning-meta {
-      display: flex;
-      gap: 8px;
-      align-items: center;
-      flex-wrap: wrap;
-      font: 600 12px/1.4 "SF Pro Text", "Helvetica Neue", Arial, sans-serif;
-      color: #6b7280;
-    }
-    .meeting-reasoning-chip {
-      display: inline-flex;
-      align-items: center;
-      border-radius: 999px;
-      padding: 2px 8px;
-      background: rgba(219, 199, 167, 0.28);
-      color: #6b4f30;
-    }
-    .meeting-reasoning-content {
-      font-size: 14px;
-      line-height: 1.7;
-      color: #1f2937;
-    }
-    .meeting-markdown {
-      display: grid;
-      gap: 0.8em;
-    }
-    .meeting-markdown > :first-child {
-      margin-top: 0;
-    }
-    .meeting-markdown > :last-child {
-      margin-bottom: 0;
-    }
-    .meeting-markdown p,
-    .meeting-markdown ul,
-    .meeting-markdown ol,
-    .meeting-markdown pre,
-    .meeting-markdown blockquote,
-    .meeting-markdown table,
-    .meeting-markdown h1,
-    .meeting-markdown h2,
-    .meeting-markdown h3,
-    .meeting-markdown h4 {
-      margin: 0;
-    }
-    .meeting-markdown h1,
-    .meeting-markdown h2,
-    .meeting-markdown h3,
-    .meeting-markdown h4 {
-      line-height: 1.25;
-      letter-spacing: -0.01em;
-    }
-    .meeting-markdown ul,
-    .meeting-markdown ol {
-      padding-left: 1.3rem;
-    }
-    .meeting-markdown li + li {
-      margin-top: 0.28rem;
-    }
-    .meeting-markdown code {
-      font-family: "SFMono-Regular", "JetBrains Mono", Consolas, monospace;
-      font-size: 0.92em;
-      padding: 0.14em 0.36em;
-      border-radius: 8px;
-      background: rgba(148, 163, 184, 0.18);
-    }
-    .meeting-markdown pre {
-      overflow-x: auto;
-      padding: 0.9rem 1rem;
-      border-radius: 16px;
-      background: rgba(15, 23, 42, 0.94);
-      color: #e5eef8;
-      box-shadow: inset 0 1px 0 rgba(255,255,255,0.05);
-    }
-    .meeting-markdown pre code {
-      padding: 0;
-      background: transparent;
-      color: inherit;
-    }
-    .meeting-markdown table {
-      width: 100%;
-      border-collapse: collapse;
-      font-size: 0.94em;
-      border-radius: 14px;
-      overflow: hidden;
-      border: 1px solid rgba(126, 105, 78, 0.16);
-    }
-    .meeting-markdown th,
-    .meeting-markdown td {
-      padding: 0.6rem 0.72rem;
-      border-bottom: 1px solid rgba(126, 105, 78, 0.12);
-      text-align: left;
-      vertical-align: top;
-    }
-    .meeting-markdown th {
-      background: rgba(219, 199, 167, 0.2);
-      font-weight: 700;
-    }
-    .meeting-markdown blockquote {
-      padding-left: 0.9rem;
-      border-left: 3px solid rgba(217, 119, 6, 0.45);
-      color: #6b4f30;
-    }
-    .meeting-markdown a {
-      color: #0f766e;
-    }
-    .meeting-markdown-user {
-      color: inherit;
-    }
-    .meeting-bubble-row.user .meeting-markdown,
-    .meeting-bubble-row.user .meeting-markdown p,
-    .meeting-bubble-row.user .meeting-markdown li,
-    .meeting-bubble-row.user .meeting-markdown ul,
-    .meeting-bubble-row.user .meeting-markdown ol,
-    .meeting-bubble-row.user .meeting-markdown strong,
-    .meeting-bubble-row.user .meeting-markdown em,
-    .meeting-bubble-row.user .meeting-markdown h1,
-    .meeting-bubble-row.user .meeting-markdown h2,
-    .meeting-bubble-row.user .meeting-markdown h3,
-    .meeting-bubble-row.user .meeting-markdown h4,
-    .meeting-bubble-row.user .meeting-markdown h5,
-    .meeting-bubble-row.user .meeting-markdown h6,
-    .meeting-bubble-row.user .meeting-markdown td,
-    .meeting-bubble-row.user .meeting-markdown th {
-      color: #f8fafc;
-    }
-    .meeting-bubble-row.user .meeting-markdown code {
-      background: rgba(255,255,255,0.12);
-      color: #f8fafc;
-    }
-    .meeting-bubble-row.user .meeting-markdown blockquote {
-      color: rgba(248, 250, 252, 0.88);
-      border-left-color: rgba(255,255,255,0.35);
-    }
-    .meeting-bubble-row.user .meeting-markdown a {
-      color: #dbeafe;
-    }
-    .meeting-bubble-row.user .meeting-markdown table,
-    .meeting-bubble-row.user .meeting-markdown th,
-    .meeting-bubble-row.user .meeting-markdown td {
-      border-color: rgba(255,255,255,0.14);
-    }
-    .meeting-bubble-row.user .meeting-markdown th {
-      background: rgba(255,255,255,0.1);
-    }
-    .meeting-bubble.pending {
-      position: relative;
-      overflow: hidden;
-    }
-    .meeting-bubble.pending::after {
-      content: '';
-      position: absolute;
-      inset: 0;
-      background: linear-gradient(90deg, transparent 0%, rgba(255,255,255,0.16) 50%, transparent 100%);
-      transform: translateX(-100%);
-      animation: meetingShimmer 1.4s infinite;
-    }
-    .meeting-spinner {
-      display: inline-flex;
-      gap: 4px;
-      align-items: center;
-    }
-    .meeting-spinner-dot {
-      width: 7px;
-      height: 7px;
-      border-radius: 999px;
-      background: currentColor;
-      opacity: 0.35;
-      animation: meetingPulse 1.2s infinite;
-    }
-    .meeting-spinner-dot:nth-child(2) {
-      animation-delay: 0.15s;
-    }
-    .meeting-spinner-dot:nth-child(3) {
-      animation-delay: 0.3s;
-    }
-    @keyframes meetingPulse {
-      0%, 80%, 100% { opacity: 0.28; transform: scale(0.92); }
-      40% { opacity: 0.9; transform: scale(1); }
-    }
-    @keyframes meetingShimmer {
-      from { transform: translateX(-100%); }
-      to { transform: translateX(100%); }
-    }
-    .meeting-composer {
-      display: grid;
-      gap: 12px;
-      padding: 18px 22px 22px;
-      border-top: 1px solid rgba(126, 105, 78, 0.14);
-      background: linear-gradient(180deg, rgba(255,255,255,0.68), rgba(255,252,245,0.92));
-    }
-    .meeting-composer textarea {
-      min-height: 108px;
-      border-radius: 18px;
-      padding: 14px 16px;
-      background: rgba(255,255,255,0.92);
-    }
-    .meeting-inline-actions {
-      display: flex;
-      gap: 12px;
-      align-items: center;
-      justify-content: space-between;
-      flex-wrap: wrap;
-    }
-    .meeting-detail-box {
-      min-height: 220px;
-      max-height: 320px;
-    }
-    @media (max-width: 960px) {
-      .meeting-app {
-        grid-template-columns: 1fr;
-      }
-      .meeting-chat-panel {
-        min-height: 680px;
-      }
-      .meeting-bubble-stack {
-        max-width: 100%;
-      }
-    }
-  </style>
-    <script src="/vendor/marked/marked.umd.js"></script>
-</head>
-<body>
-  <main>
-    <section class="hero">
-      <h1>browser-ai-bridge</h1>
-      <p>这是本地网页 AI 桥接控制台。你可以在这里打开任意 provider、查看当前会话、调试远端页面结构，并直接发送测试消息。</p>
-    </section>
-
-    <section class="panel stack">
-      <h2>当前场景提示</h2>
-      <div id="sshHint" class="status warn">如果服务运行在另一台带图形桌面的机器上，Playwright 打开的浏览器会出现在那台机器的桌面会话里。当前页面只负责触发打开动作和显示状态，不会直接嵌入远端浏览器窗口。</div>
-      <div class="meta">
-        <div class="pill">服务地址: http://${appConfig.host}:${appConfig.port}</div>
-        <div class="pill">默认 provider: ${appConfig.defaultProvider}</div>
-        <div class="pill">HEADLESS: ${String(appConfig.headless)}</div>
-      </div>
-    </section>
-
-    <div class="grid">
-      <section class="panel stack">
-        <h3>服务状态</h3>
-        <label>
-          当前 Provider
-          <select id="controlProviderSelect">
-            <option value="deepseek" selected>deepseek</option>
-            <option value="chatgpt">chatgpt</option>
-            <option value="gemini">gemini</option>
-            <option value="claude">claude</option>
-            <option value="grok">grok</option>
-            <option value="qwen">qwen</option>
-          </select>
-        </label>
-        <div class="actions">
-          <button id="refreshStatusBtn" type="button">刷新状态</button>
-          <button id="reloadSelectorsBtn" type="button" class="secondary">重载 Selector</button>
-          <button id="loadProviderBtn" type="button" class="tertiary">查看当前 Provider 配置</button>
-          <button id="listSessionsBtn" type="button" class="secondary">查看当前会话</button>
-        </div>
-        <div id="statusBox" class="status">还没有加载状态。</div>
-        <pre id="providerBox">点击“查看当前 Provider 配置”后，这里会显示格式化配置。</pre>
-        <pre id="sessionBox">点击“查看当前会话”后，这里会显示当前内存中的会话和 conversationId。</pre>
-      </section>
-
-      <section class="panel stack">
-        <h3>登录与会话</h3>
-        <p class="small">日常发送默认在后台复用现有页签运行，不主动抢前台。只有你点这里，或者服务检测到需要人工登录/解风控时，才会把对应 provider 页签切到前台。</p>
-        <div class="actions">
-          <button id="openDeepSeekBtn" type="button">打开当前 Provider 页面</button>
-          <button id="inspectPageBtn" type="button" class="tertiary">调试当前页面</button>
-          <button id="clearSessionBtn" type="button" class="secondary">清理当前 conversationId</button>
-        </div>
-        <div id="openSessionBox" class="status">还没有执行打开操作。</div>
-        <pre id="inspectBox">点击“调试当前页面”后，这里会显示当前远端页面上的按钮、输入框和标题。</pre>
-      </section>
-    </div>
-
-    <section class="panel stack">
-      <h3>测试消息</h3>
-      <label>
-        Provider
-        <select id="providerSelect">
-          <option value="deepseek" selected>deepseek</option>
-          <option value="chatgpt">chatgpt</option>
-          <option value="gemini">gemini</option>
-          <option value="claude">claude</option>
-          <option value="grok">grok</option>
-          <option value="qwen">qwen</option>
-        </select>
-      </label>
-      <label>
-        conversationId
-        <input id="conversationIdInput" placeholder="留空=OpenAI 兼容 best effort 模式；填写后=绑定到指定 conversationId" />
-      </label>
-      <div class="grid">
-        <label>
-          <span>智能搜索</span>
-          <select id="searchModeSelect">
-            <option value="auto">auto</option>
-            <option value="on" selected>on</option>
-            <option value="off">off</option>
-          </select>
-        </label>
-        <label>
-          <span>深度思考</span>
-          <select id="reasoningModeSelect">
-            <option value="auto">auto</option>
-            <option value="on" selected>on</option>
-            <option value="off">off</option>
-          </select>
-        </label>
-      </div>
-      <label>
-        用户消息
-        <textarea id="userPrompt">用一句话解释 TCP 和 UDP 的区别。</textarea>
-      </label>
-      <div class="actions">
-        <button id="sendTestBtn" type="button">发送测试消息</button>
-      </div>
-      <div id="chatStatusBox" class="status">还没有发送测试消息。</div>
-      <pre id="chatResponseBox">发送成功后，这里会显示格式化响应。</pre>
-    </section>
-
-    <section class="panel stack">
-      <h2>轻量会议试玩</h2>
-      <p class="small">这里直接调用特殊模型名。用户消息保持普通 user 消息格式，中间讨论作为 reasoning_content，最终汇总作为 assistant 回复。</p>
-      <div class="meeting-app">
-        <aside class="meeting-sidebar">
-          <label>
-            会议模型
-            <select id="meetingModelSelect">
-              ${buildMeetingOptionsHtml()}
-            </select>
-          </label>
-          <label>
-            conversationId
-            <input id="meetingConversationIdInput" placeholder="留空时首次发送自动生成，之后页面会复用" />
-          </label>
-          <label>
-            轮数
-            <input id="meetingRoundsInput" type="number" min="1" max="4" value="2" />
-          </label>
-          <label>
-            参与者（逗号分隔 provider）
-            <input id="meetingParticipantsInput" value="deepseek,chatgpt,qwen" />
-          </label>
-          <label>
-            总结人 provider
-            <input id="meetingSummarizerInput" value="deepseek" />
-          </label>
-          <p class="small">规则：如果 summarizer provider 也出现在 participants 里，则第一个匹配到的 member 会兼任统筹者，固定先发言并最后总结；否则会额外创建独立统筹者会话。participants 的顺序决定其余 member 的发言顺序；重复 provider 会被视为不同 member 会话。</p>
-          <div id="meetingStatusBox" class="status">还没有开始会议。</div>
-          <pre id="meetingDetailsBox" class="meeting-detail-box">发送后这里会显示模板、参与者、会话号和 reasoning transcript。</pre>
-        </aside>
-        <div class="panel meeting-chat-panel">
-          <div class="meeting-chat-header">
-            <h3 style="margin:0;">Meeting Chat</h3>
-            <p id="meetingTemplateHint">多个网页 AI 会围绕你的普通用户消息快速拆题协作，最后只返回统一答复。</p>
-          </div>
-          <div id="meetingChatScroll" class="meeting-chat-scroll"></div>
-          <div class="meeting-composer">
-            <textarea id="meetingComposerInput" placeholder="输入一条普通用户消息，例如：请帮我比较这三个实现方向的取舍。"></textarea>
-            <div class="meeting-inline-actions">
-              <div class="actions" style="margin-top:0;">
-                <button id="meetingSendBtn" type="button">发送到会议</button>
-                <button id="meetingResetBtn" type="button" class="secondary">重置对话</button>
-              </div>
-              <span class="small">当前页面会把最终总结显示成主对话，把中间会议过程放到 reasoning transcript。</span>
-            </div>
-          </div>
-        </div>
-      </div>
-    </section>
-
-    <section class="panel stack">
-      <h3>对应的 API</h3>
-      <pre>POST /session/:provider/open
-    POST /providers/reload
-    GET  /providers/:provider
-        <pre>GET  /health
-      GET  /providers
-      GET  /providers/:provider
-      GET  /sessions
-      POST /providers/reload
-      POST /session/:provider/open
-      GET  /session/:provider/inspect
-      POST /session/:provider/clear
-      POST /v1/chat/completions</pre>
-    </section>
-  </main>
-  <script>
-    const statusBox = document.getElementById('statusBox');
-    const providerBox = document.getElementById('providerBox');
-    const sessionBox = document.getElementById('sessionBox');
-    const openSessionBox = document.getElementById('openSessionBox');
-    const inspectBox = document.getElementById('inspectBox');
-    const chatStatusBox = document.getElementById('chatStatusBox');
-    const chatResponseBox = document.getElementById('chatResponseBox');
-    const meetingStatusBox = document.getElementById('meetingStatusBox');
-    const meetingDetailsBox = document.getElementById('meetingDetailsBox');
-    const meetingChatScroll = document.getElementById('meetingChatScroll');
-
-    const refreshStatusBtn = document.getElementById('refreshStatusBtn');
-    const reloadSelectorsBtn = document.getElementById('reloadSelectorsBtn');
-    const loadProviderBtn = document.getElementById('loadProviderBtn');
-    const listSessionsBtn = document.getElementById('listSessionsBtn');
-    const openDeepSeekBtn = document.getElementById('openDeepSeekBtn');
-    const inspectPageBtn = document.getElementById('inspectPageBtn');
-    const clearSessionBtn = document.getElementById('clearSessionBtn');
-    const sendTestBtn = document.getElementById('sendTestBtn');
-    const meetingSendBtn = document.getElementById('meetingSendBtn');
-    const meetingResetBtn = document.getElementById('meetingResetBtn');
-
-    const controlProviderSelect = document.getElementById('controlProviderSelect');
-    const providerSelect = document.getElementById('providerSelect');
-    const conversationIdInput = document.getElementById('conversationIdInput');
-    const searchModeSelect = document.getElementById('searchModeSelect');
-    const reasoningModeSelect = document.getElementById('reasoningModeSelect');
-    const userPrompt = document.getElementById('userPrompt');
-    const meetingModelSelect = document.getElementById('meetingModelSelect');
-    const meetingConversationIdInput = document.getElementById('meetingConversationIdInput');
-    const meetingRoundsInput = document.getElementById('meetingRoundsInput');
-    const meetingParticipantsInput = document.getElementById('meetingParticipantsInput');
-    const meetingSummarizerInput = document.getElementById('meetingSummarizerInput');
-    const meetingComposerInput = document.getElementById('meetingComposerInput');
-    const meetingTemplateHint = document.getElementById('meetingTemplateHint');
-
-    let meetingMessages = [];
-    let meetingPendingState = null;
-    let meetingPendingTimer = null;
-    let meetingLiveTranscript = [];
-    let meetingLiveMeta = null;
-    let meetingLiveReasoningKey = null;
-    let meetingProgressMeta = null;
-    const meetingExpandedReasoningKeys = new Set();
-    const meetingTemplateHints = ${buildMeetingHintMapScript()};
-
-    function setStatus(element, kind, text) {
-      element.className = 'status' + (kind ? ' ' + kind : '');
-      element.textContent = text;
-    }
-
-    function pretty(value) {
-      return JSON.stringify(value, null, 2);
-    }
-
-    function escapeHtml(value) {
-      return String(value)
-        .replaceAll('&', '&amp;')
-        .replaceAll('<', '&lt;')
-        .replaceAll('>', '&gt;');
-    }
-
-    function formatMeetingStage(entry) {
-      if (entry.stage === 'assignment') {
-        return '拆分任务 / 统筹初判';
-      }
-      if (entry.stage === 'summary') {
-        return '最终总结';
-      }
-      if (entry.stage === 'discussion') {
-        return entry.round ? '第 ' + entry.round + ' 轮讨论' : '讨论';
-      }
-      return '输入';
-    }
-
-    function renderMarkdownHtml(value, variant = 'default') {
-      const safeSource = escapeHtml(value || '');
-      const rendered = typeof globalThis.marked?.parse === 'function'
-        ? globalThis.marked.parse(safeSource, {
-            gfm: true,
-            breaks: true,
-          })
-        : safeSource.split('\\n').join('<br>');
-      return '<div class="meeting-markdown meeting-markdown-' + variant + '">' + rendered + '</div>';
-    }
-
-    function renderMeetingReasoningDetails(message, reasoningKey) {
-      const transcript = Array.isArray(message.transcript) ? message.transcript : [];
-      const visibleEntries = transcript.filter((entry) => entry && entry.role === 'assistant' && (entry.stage === 'assignment' || entry.stage === 'discussion'));
-
-      if (visibleEntries.length === 0) {
-        return '';
-      }
-
-      const entriesHtml = visibleEntries.map((entry) => {
-        const metaParts = [
-          '<span>' + escapeHtml(entry.speaker || 'assistant') + '</span>',
-          '<span class="meeting-reasoning-chip">' + escapeHtml(formatMeetingStage(entry)) + '</span>',
-        ];
-
-        if (entry.provider) {
-          metaParts.push('<span>' + escapeHtml(entry.provider) + '</span>');
-        }
-
-        return '<div class="meeting-reasoning-entry">'
-          + '<div class="meeting-reasoning-meta">' + metaParts.join('') + '</div>'
-          + '<div class="meeting-reasoning-content">' + renderMarkdownHtml(entry.content || '', 'reasoning') + '</div>'
-          + '</div>';
-      }).join('');
-
-      const openAttr = reasoningKey && meetingExpandedReasoningKeys.has(reasoningKey) ? ' open' : '';
-      const keyAttr = reasoningKey ? ' data-reasoning-key="' + escapeHtml(reasoningKey) + '"' : '';
-      return '<details class="meeting-reasoning"' + keyAttr + openAttr + '><summary>查看本次会议里每个 AI 说了什么</summary><div class="meeting-reasoning-body">' + entriesHtml + '</div></details>';
-    }
-
-    function buildMeetingTranscriptText(transcript) {
-      if (!Array.isArray(transcript) || transcript.length === 0) {
-        return '(空)';
-      }
-
-      const visibleEntries = transcript.filter((entry) => entry && entry.role === 'assistant' && (entry.stage === 'assignment' || entry.stage === 'discussion'));
-      if (visibleEntries.length === 0) {
-        return '(空)';
-      }
-
-      return visibleEntries.map((entry) => {
-        const suffix = entry.provider ? ' · ' + entry.provider : '';
-        return '### ' + formatMeetingStage(entry) + ' · ' + (entry.speaker || 'assistant') + suffix + '\\n' + (entry.content || '');
-      }).join('\\n\\n');
-    }
-
-    function refreshMeetingLiveDetails() {
-      if (!meetingPendingState && !meetingLiveMeta && meetingLiveTranscript.length === 0) {
-        return;
-      }
-
-      meetingDetailsBox.textContent = [
-        'meeting:',
-        pretty(meetingLiveMeta || {}),
-        '',
-        'reasoning transcript:',
-        buildMeetingTranscriptText(meetingLiveTranscript),
-        '',
-        'status:',
-        meetingPendingState ? meetingPendingState.label : 'completed',
-      ].join('\\n');
-    }
-
-    async function requestEventStream(url, payload, onEvent) {
-      const response = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-      });
-
-      if (!response.ok) {
-        const contentType = response.headers.get('content-type') || '';
-        const errorPayload = contentType.includes('application/json') ? await response.json() : await response.text();
-        const errorText = typeof errorPayload === 'string' ? errorPayload : errorPayload?.error?.message || pretty(errorPayload);
-        throw new Error(errorText);
-      }
-
-      if (!response.body) {
-        throw new Error('服务端没有返回可读取的流');
-      }
-
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = '';
-
-      while (true) {
-        const chunk = await reader.read();
-        if (chunk.done) {
-          buffer += decoder.decode();
-        } else {
-          buffer += decoder.decode(chunk.value, { stream: true });
-        }
-
-        let boundaryIndex = buffer.indexOf('\\n\\n');
-        while (boundaryIndex >= 0) {
-          const rawEvent = buffer.slice(0, boundaryIndex);
-          buffer = buffer.slice(boundaryIndex + 2);
-          const data = rawEvent
-            .split('\\n')
-            .filter((line) => line.startsWith('data:'))
-            .map((line) => line.slice(5).trim())
-            .join('\\n');
-
-          if (data) {
-            if (data === '[DONE]') {
-              return;
-            }
-            onEvent(JSON.parse(data));
-          }
-
-          boundaryIndex = buffer.indexOf('\\n\\n');
-        }
-
-        if (chunk.done) {
-          return;
-        }
-      }
-    }
-
-    function renderMeetingChat() {
-      const pendingTranscriptHtml = meetingLiveTranscript.length ? renderMeetingReasoningDetails({ transcript: meetingLiveTranscript }, meetingLiveReasoningKey) : '';
-      const pendingHtml = meetingPendingState
-        ? '<div class="meeting-bubble-row assistant">'
-          + '<div class="meeting-avatar assistant">AI</div>'
-          + '<div class="meeting-bubble-stack">'
-          + '<div class="meeting-bubble-meta"><span>会议助手</span><span>' + escapeHtml(meetingPendingState.label) + '</span></div>'
-          + '<div class="meeting-bubble pending"><span class="meeting-spinner"><span class="meeting-spinner-dot"></span><span class="meeting-spinner-dot"></span><span class="meeting-spinner-dot"></span></span> 正在开会，已等待 ' + meetingPendingState.seconds + ' 秒</div>'
-          + pendingTranscriptHtml
-          + '</div></div>'
-        : '';
-
-      if (meetingMessages.length === 0) {
-        meetingChatScroll.innerHTML = '<div class="meeting-bubble-row assistant"><div class="meeting-avatar assistant">AI</div><div class="meeting-bubble-stack"><div class="meeting-bubble-meta"><span>会议助手</span><span>准备就绪</span></div><div class="meeting-bubble">从这里开始提问。系统会把你的消息当作普通 user 消息，然后调用特殊会议模型，让多个 provider 自动讨论并输出统一答复。</div></div></div>' + pendingHtml;
-        return;
-      }
-
-      meetingChatScroll.innerHTML = meetingMessages.map((message, index) => {
-        const kind = message.role === 'user' ? 'user' : 'assistant';
-        const title = kind === 'user' ? '你' : '会议助手';
-        const reasoningDetails = kind === 'assistant' ? renderMeetingReasoningDetails(message, message.reasoningKey || ('message-' + index)) : '';
-        return '<div class="meeting-bubble-row ' + kind + '">' +
-          '<div class="meeting-avatar ' + kind + '">' + (kind === 'user' ? 'YOU' : 'AI') + '</div>' +
-          '<div class="meeting-bubble-stack ' + kind + '">' +
-          '<div class="meeting-bubble-meta"><span>' + title + '</span><span>第 ' + (index + 1) + ' 条</span></div>' +
-          '<div class="meeting-bubble">' + renderMarkdownHtml(message.content, kind) + '</div>' +
-          reasoningDetails +
-          '</div></div>';
-      }).join('') + pendingHtml;
-      meetingChatScroll.querySelectorAll('.meeting-reasoning').forEach((element) => {
-        element.addEventListener('toggle', () => {
-          const reasoningKey = element.getAttribute('data-reasoning-key');
-          if (!reasoningKey) {
-            return;
-          }
-          if (element.open) {
-            meetingExpandedReasoningKeys.add(reasoningKey);
-          } else {
-            meetingExpandedReasoningKeys.delete(reasoningKey);
-          }
-        });
-      });
-      meetingChatScroll.scrollTop = meetingChatScroll.scrollHeight;
-    }
-
-    function stopMeetingPending() {
-      meetingPendingState = null;
-      if (meetingPendingTimer) {
-        clearInterval(meetingPendingTimer);
-        meetingPendingTimer = null;
-      }
-      meetingSendBtn.disabled = false;
-      meetingResetBtn.disabled = false;
-      refreshMeetingLiveDetails();
-    }
-
-    function startMeetingPending() {
-      const startedAt = Date.now();
-      meetingPendingState = { label: '正在启动协作', seconds: 0 };
-      meetingProgressMeta = {
-        discussionExpected: 0,
-        discussionSeen: 0,
-      };
-      meetingSendBtn.disabled = true;
-      meetingResetBtn.disabled = true;
-      if (meetingPendingTimer) {
-        clearInterval(meetingPendingTimer);
-      }
-      meetingPendingTimer = setInterval(() => {
-        const elapsed = Math.max(1, Math.floor((Date.now() - startedAt) / 1000));
-        meetingPendingState = {
-          label: meetingPendingState ? meetingPendingState.label : '正在启动协作',
-          seconds: elapsed,
-        };
-        refreshMeetingLiveDetails();
-        renderMeetingChat();
-      }, 1000);
-    }
-
-    function syncMeetingTemplateHint() {
-      const value = meetingModelSelect.value;
-      meetingTemplateHint.textContent = meetingTemplateHints[value] || '多个网页 AI 会围绕你的普通用户消息快速拆题协作，最后只返回统一答复。';
-    }
-
-    function buildMeetingDetailsText(payload, reasoningText) {
-      return [
-        'meeting:',
-        pretty(payload.meeting || {}),
-        '',
-        'reasoning transcript:',
-        reasoningText || '(空)',
-        '',
-        'full response:',
-        pretty(payload),
-      ].join('\\n');
-    }
-
-    function buildMeetingErrorText() {
-      return [
-        '会议请求失败。常见原因:',
-        '1. 某个 provider 当前未登录。',
-        '2. 某个网页要求手动选择候选回答。',
-        '3. 某个网页正在限额、掉线或网络异常。',
-        '4. 某个 selector 变化导致无法发送。',
-      ].join('\\n');
-    }
-
-    async function requestJson(url, options) {
-      const response = await fetch(url, options);
-      const contentType = response.headers.get('content-type') || '';
-      const payload = contentType.includes('application/json') ? await response.json() : await response.text();
-
-      if (!response.ok) {
-        const errorText = typeof payload === 'string' ? payload : payload?.error?.message || pretty(payload);
-        throw new Error(errorText);
-      }
-
-      return payload;
-    }
-
-    async function refreshStatus() {
-      setStatus(statusBox, '', '正在读取服务状态...');
-      try {
-        const health = await requestJson('/health');
-        const lines = [
-          '服务正常。',
-          'defaultProvider: ' + health.defaultProvider,
-          'headless: ' + health.headless,
-        ];
-        setStatus(statusBox, 'ok', lines.join('\\n'));
-      } catch (error) {
-        setStatus(statusBox, 'error', '读取服务状态失败: ' + error.message);
-      }
-    }
-
-    async function loadProvider() {
-      const provider = controlProviderSelect.value;
-      providerBox.textContent = '正在读取 ' + provider + ' 配置...';
-      try {
-        const payload = await requestJson('/providers/' + provider);
-        providerBox.textContent = pretty(payload);
-      } catch (error) {
-        providerBox.textContent = '读取配置失败:\\n' + error.message;
-      }
-    }
-
-    async function reloadSelectors() {
-      setStatus(statusBox, '', '正在重载 selector 配置...');
-      try {
-        const payload = await requestJson('/providers/reload', { method: 'POST' });
-        setStatus(statusBox, 'ok', 'selector 已重载。覆盖文件路径: ' + payload.selectorOverridesPath);
-        await loadProvider();
-      } catch (error) {
-        setStatus(statusBox, 'error', '重载 selector 失败: ' + error.message);
-      }
-    }
-
-    async function loadSessions() {
-      sessionBox.textContent = '正在读取当前会话...';
-      try {
-        const payload = await requestJson('/sessions');
-        sessionBox.textContent = pretty(payload);
-      } catch (error) {
-        sessionBox.textContent = '读取会话失败:\\n' + error.message;
-      }
-    }
-
-    async function openDeepSeek() {
-      const provider = controlProviderSelect.value;
-      setStatus(openSessionBox, '', '正在请求打开 ' + provider + ' 页面...');
-      try {
-        const payload = await requestJson('/session/' + provider + '/open', { method: 'POST' });
-        const lines = [
-          '已触发打开动作。',
-          'provider: ' + payload.provider,
-          'currentUrl: ' + payload.url,
-          '注意: 浏览器会出现在当前服务所在机器的图形桌面会话中。',
-        ];
-        setStatus(openSessionBox, 'ok', lines.join('\\n'));
-      } catch (error) {
-        setStatus(openSessionBox, 'error', '打开 provider 失败: ' + error.message);
-      }
-    }
-
-    async function inspectPage() {
-      const provider = controlProviderSelect.value;
-      const conversationId = conversationIdInput.value.trim();
-      inspectBox.textContent = '正在抓取当前远端页面结构...';
-      try {
-        const query = conversationId ? '?conversationId=' + encodeURIComponent(conversationId) : '';
-        const payload = await requestJson('/session/' + provider + '/inspect' + query);
-        inspectBox.textContent = pretty(payload);
-      } catch (error) {
-        inspectBox.textContent = '抓取页面结构失败:\\n' + error.message;
-      }
-    }
-
-    async function clearSession() {
-      const provider = controlProviderSelect.value;
-      const conversationId = conversationIdInput.value.trim();
-      if (!conversationId) {
-        setStatus(openSessionBox, '', '正在清理该 provider 的默认 best effort 会话...');
-      } else {
-        setStatus(openSessionBox, '', '正在清理当前 conversationId 对应的会话...');
-      }
-      try {
-        const payload = await requestJson('/session/' + provider + '/clear', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ conversationId: conversationId || undefined }),
-        });
-        setStatus(openSessionBox, 'ok', '会话已清理: ' + pretty(payload));
-        await loadSessions();
-      } catch (error) {
-        setStatus(openSessionBox, 'error', '清理会话失败: ' + error.message);
-      }
-    }
-
-    async function sendTest() {
-      const provider = providerSelect.value;
-      const conversationId = conversationIdInput.value.trim();
-      const user = userPrompt.value.trim();
-      const searchMode = searchModeSelect.value;
-      const reasoningMode = reasoningModeSelect.value;
-
-      if (!user) {
-        setStatus(chatStatusBox, 'warn', '请先填写“用户消息”。');
-        return;
-      }
-
-      setStatus(chatStatusBox, '', '正在发送消息，请等待网页 AI 回复...');
-      chatResponseBox.textContent = '等待响应中...';
-
-      try {
-        const payload = await requestJson('/v1/chat/completions', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            provider,
-            model: provider + '-web',
-            conversationId: conversationId || undefined,
-            enableSearch: searchMode === 'auto' ? undefined : searchMode === 'on',
-            enableReasoning: reasoningMode === 'auto' ? undefined : reasoningMode === 'on',
-            messages: [
-              { role: 'user', content: user },
-            ],
-          }),
-        });
-
-        const assistantText = payload?.choices?.[0]?.message?.content || '';
-          const reasoningText = payload?.choices?.[0]?.message?.reasoning_content || '';
-        setStatus(chatStatusBox, 'ok', assistantText ? '收到回复了。下面是完整响应和提取出的回复文本。' : '请求成功，但没有提取到回复文本。');
-          chatResponseBox.textContent = 'reasoning:\\n' + (reasoningText || '(空)') + '\\n\\nassistant:\\n' + (assistantText || '(空)') + '\\n\\nfull response:\\n' + pretty(payload);
-      } catch (error) {
-        setStatus(chatStatusBox, 'error', '发送失败: ' + error.message);
-        chatResponseBox.textContent = '请求失败。常见原因:\\n1. 浏览器会话还没登录。\\n2. 当前 provider 页面结构变了，selector 失效。\\n3. 服务所在机器的图形桌面会话不可用或未完成登录。';
-      }
-    }
-
-    async function sendMeetingMessage() {
-      const content = meetingComposerInput.value.trim();
-      if (!content) {
-        setStatus(meetingStatusBox, 'warn', '请先输入用户消息。');
-        return;
-      }
-
-      const messageHistory = [...meetingMessages, { role: 'user', content }];
-      meetingMessages = messageHistory;
-      meetingLiveTranscript = [];
-      meetingLiveMeta = null;
-      meetingLiveReasoningKey = 'meeting-turn-' + Date.now();
-      meetingProgressMeta = null;
-      renderMeetingChat();
-      meetingComposerInput.value = '';
-      setStatus(meetingStatusBox, '', '会议进行中，请等待多个 provider 完成讨论和汇总...');
-      startMeetingPending();
-      refreshMeetingLiveDetails();
-      renderMeetingChat();
-
-      try {
-        const rounds = Number(meetingRoundsInput.value) || 2;
-        const participants = meetingParticipantsInput.value.split(',').map((item) => item.trim()).filter(Boolean);
-        const summarizer = meetingSummarizerInput.value.trim() || undefined;
-        let payload = null;
-        await requestEventStream('/v1/chat/completions', {
-          model: meetingModelSelect.value,
-          stream: true,
-          conversationId: meetingConversationIdInput.value.trim() || undefined,
-          messages: messageHistory,
-          meeting: {
-            rounds,
-            participants: participants.length ? participants : undefined,
-            summarizer,
-          },
-        }, (event) => {
-          if (event?.type === 'meeting.started') {
-            meetingLiveMeta = event.meeting || null;
-            if (event?.meeting?.conversationId) {
-              meetingConversationIdInput.value = event.meeting.conversationId;
-            }
-            const discussionParticipantsByRound = Array.isArray(event?.meeting?.policy?.discussionParticipantsByRound)
-              ? event.meeting.policy.discussionParticipantsByRound
-              : [];
-            const discussionParticipants = Array.isArray(event?.meeting?.policy?.discussionParticipants)
-              ? event.meeting.policy.discussionParticipants
-              : [];
-            const discussionExpected = discussionParticipantsByRound.length > 0
-              ? discussionParticipantsByRound.reduce((sum, participants) => sum + (Array.isArray(participants) ? participants.length : 0), 0)
-              : discussionParticipants.length * (Number(event?.meeting?.rounds) || 0);
-            meetingProgressMeta = {
-              discussionExpected,
-              discussionSeen: 0,
-            };
-            if (meetingPendingState) {
-              meetingPendingState = { ...meetingPendingState, label: '统筹者正在拆分问题' };
-            }
-            refreshMeetingLiveDetails();
-            renderMeetingChat();
-            return;
-          }
-
-          if (event?.type === 'meeting.entry') {
-            meetingLiveTranscript = [...meetingLiveTranscript, event.entry];
-            if (meetingPendingState) {
-              let nextLabel = '统筹者正在整理最终答复';
-              if (event.entry?.stage === 'assignment') {
-                const expected = meetingProgressMeta?.discussionExpected || 0;
-                nextLabel = expected > 0 ? '其他成员正在推进各自部分（0/' + expected + '）' : '统筹者正在整理最终答复';
-              } else if (event.entry?.stage === 'discussion') {
-                if (meetingProgressMeta) {
-                  meetingProgressMeta = {
-                    ...meetingProgressMeta,
-                    discussionSeen: meetingProgressMeta.discussionSeen + 1,
-                  };
-                }
-                const seen = meetingProgressMeta?.discussionSeen || 0;
-                const expected = meetingProgressMeta?.discussionExpected || 0;
-                nextLabel = seen < expected
-                  ? (event.entry?.speaker || '成员') + ' 已提交，本轮还剩 ' + (expected - seen) + ' 条讨论消息'
-                  : '统筹者正在整理最终答复';
-              }
-              meetingPendingState = { ...meetingPendingState, label: nextLabel };
-            }
-            refreshMeetingLiveDetails();
-            renderMeetingChat();
-            return;
-          }
-
-          if (event?.type === 'meeting.completed') {
-            payload = event.response;
-            return;
-          }
-
-          if (event?.type === 'meeting.error') {
-            throw new Error(event?.error?.message || '会议执行失败');
-          }
-        });
-
-        if (!payload) {
-          throw new Error('会议流已结束，但没有收到最终结果');
-        }
-
-        const assistantText = payload?.choices?.[0]?.message?.content || '';
-        const reasoningText = payload?.choices?.[0]?.message?.reasoning_content || '';
-        const nextConversationId = payload?.meeting?.conversationId || meetingConversationIdInput.value.trim();
-        if (nextConversationId) {
-          meetingConversationIdInput.value = nextConversationId;
-        }
-        meetingMessages = [...messageHistory, {
-          role: 'assistant',
-          content: assistantText,
-          transcript: [...meetingLiveTranscript],
-          reasoningKey: meetingLiveReasoningKey,
-        }];
-        stopMeetingPending();
-        renderMeetingChat();
-        meetingDetailsBox.textContent = buildMeetingDetailsText(payload, reasoningText);
-        setStatus(meetingStatusBox, 'ok', assistantText ? '会议完成，已收到最终汇总。' : '会议完成，但最终汇总为空。');
-      } catch (error) {
-        stopMeetingPending();
-        setStatus(meetingStatusBox, 'error', '会议失败: ' + error.message);
-        meetingDetailsBox.textContent = buildMeetingErrorText();
-      }
-    }
-
-    function resetMeetingChat() {
-      stopMeetingPending();
-      meetingMessages = [];
-      meetingLiveTranscript = [];
-      meetingLiveMeta = null;
-      meetingLiveReasoningKey = null;
-      meetingProgressMeta = null;
-      meetingExpandedReasoningKeys.clear();
-      meetingConversationIdInput.value = '';
-      setStatus(meetingStatusBox, '', '已重置会议对话。');
-      meetingDetailsBox.textContent = '发送后这里会显示模板、参与者、会话号和 reasoning transcript。';
-      renderMeetingChat();
-    }
-
-    function syncProviderSelection() {
-      providerSelect.value = controlProviderSelect.value;
-    }
-
-    refreshStatusBtn.addEventListener('click', refreshStatus);
-    reloadSelectorsBtn.addEventListener('click', reloadSelectors);
-    loadProviderBtn.addEventListener('click', loadProvider);
-    listSessionsBtn.addEventListener('click', loadSessions);
-    openDeepSeekBtn.addEventListener('click', openDeepSeek);
-    inspectPageBtn.addEventListener('click', inspectPage);
-    clearSessionBtn.addEventListener('click', clearSession);
-    sendTestBtn.addEventListener('click', sendTest);
-    meetingSendBtn.addEventListener('click', sendMeetingMessage);
-    meetingResetBtn.addEventListener('click', resetMeetingChat);
-    controlProviderSelect.addEventListener('change', () => {
-      syncProviderSelection();
-      loadProvider();
-    });
-    meetingModelSelect.addEventListener('change', syncMeetingTemplateHint);
-
-    meetingChatScroll.addEventListener('toggle', (event) => {
-      const target = event.target;
-      if (!(target instanceof HTMLDetailsElement) || !target.classList.contains('meeting-reasoning')) {
-        return;
-      }
-      const reasoningKey = target.getAttribute('data-reasoning-key');
-      if (!reasoningKey) {
-        return;
-      }
-      if (target.open) {
-        meetingExpandedReasoningKeys.add(reasoningKey);
-      } else {
-        meetingExpandedReasoningKeys.delete(reasoningKey);
-      }
-    });
-
-    syncProviderSelection();
-    syncMeetingTemplateHint();
-    refreshStatus();
-    loadProvider();
-    loadSessions();
-    renderMeetingChat();
-  </script>
-</body>
-</html>`);
+  res.type('html').send(CONSOLE_HTML);
 });
 
 app.get('/health', async (_req, res) => {
@@ -2009,6 +505,17 @@ app.get('/providers', (_req, res) => {
       id: provider.id,
       label: provider.label,
       url: provider.url,
+      // 暴露捕获方式：控制台据此标注"这个 provider 的答案来自真流还是 DOM"。
+      // 之前这个字段只出现在 /providers/:provider，列表端点缺了它，
+      // 导致页面把六家全标成 DOM——标记错了还不如没有。
+      ...(provider.streamCapture
+        ? {
+            streamCapture: {
+              transport: provider.streamCapture.transport,
+              reducer: provider.streamCapture.reducer,
+            },
+          }
+        : {}),
     })),
   });
 });
@@ -2018,6 +525,47 @@ app.get(['/models', '/v1/models'], (_req, res) => {
     object: 'list',
     data: listChatModels(),
   });
+});
+
+/**
+ * 只算编排计划，不碰浏览器、不发任何消息。
+ *
+ * 存在的理由：席位名（deepseek1 / deepseek2）**同时是会话身份**——
+ * 它会进 conversationId。若让前端自己算一遍，两边算法一旦漂移就会
+ * 静默复用错会话，那是最难发现的一类 bug。所以这里让服务端算、前端照抄，
+ * 前端不再自己实现命名逻辑。
+ */
+app.post('/meeting/plan', (req, res) => {
+  try {
+    const input = meetingPlanSchema.parse(req.body ?? {});
+    const template = resolveMeetingTemplate(input.template);
+    if (!template) {
+      res.status(400).json({ error: { message: `未知的会议模板: ${input.template}` } });
+      return;
+    }
+    const plan = resolveMeetingPlan(template, {
+      model: template.id,
+      messages: [],
+      meeting: {
+        ...(input.participants ? { participants: input.participants } : {}),
+        ...(input.summarizer ? { summarizer: input.summarizer } : {}),
+        ...(input.summarizerSeat ? { summarizerSeat: input.summarizerSeat } : {}),
+        ...(input.rounds ? { rounds: input.rounds } : {}),
+      },
+    });
+    res.json({
+      mode: plan.mode,
+      rounds: plan.rounds,
+      participants: plan.participants.map((participant) => ({
+        alias: participant.alias,
+        provider: participant.provider,
+      })),
+      summarizer: { alias: plan.summarizer.alias, provider: plan.summarizer.provider },
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : '计算会议计划失败';
+    res.status(400).json({ error: { message } });
+  }
 });
 
 app.get('/sessions', async (_req, res) => {
@@ -2105,7 +653,10 @@ app.post('/session/:provider/extract-latest', async (req, res) => {
     if (conversationId && !resolvedConversationId) {
       throw new Error(`未找到 ${provider} 的现有会话: ${conversationId}`);
     }
-    const client = new ProviderClient(provider);
+    const client = new ProviderClient(provider, {
+      take: (page, since) => browserManager.takeCapturedStream(page, provider, since),
+      frames: (page, since) => browserManager.streamFrames(page, provider, since),
+    });
     const latestAssistantHint = browserManager
       .getSyncedMessages(provider, resolvedConversationId)
       .slice()
@@ -2159,14 +710,35 @@ app.post('/v1/chat/completions', async (req, res) => {
         res.setHeader('Connection', 'keep-alive');
         res.flushHeaders?.();
 
-        await runMeetingCompletion(payload, meetingTemplate, completeWithProvider, {
-          onProgress: async (event) => {
-            if (event.type === 'meeting.started') {
-              effectiveMeetingConversationId = event.meeting.conversationId;
-            }
-            writeSse(res, event);
+        // **必须接住返回值。** 会议进度事件（分工、逐个发言）是流式发出去的，
+        // 但真正的总结答复只存在于返回值里——原先 await 完就丢弃、接着
+        // finishSse，客户端于是只看到一堆 meeting.entry，永远等不到总结。
+        // 表现就是"会议跑完了但没有答复"。
+        const meetingResult = await runMeetingCompletion(
+          payload,
+          meetingTemplate,
+          completeWithProvider,
+          {
+            onProgress: async (event) => {
+              if (event.type === 'meeting.started') {
+                effectiveMeetingConversationId = event.meeting.conversationId;
+              }
+              writeSse(res, event);
+            },
           },
-        });
+        );
+
+        // 总结按 OpenAI 形状补发成 chunk，这样按 chat/completions 解析的客户端
+        // （包括控制台）能用同一条 delta 逻辑把它读出来。
+        for (const chunk of buildChatCompletionChunks({
+          id: `chatcmpl-${Date.now()}`,
+          created: Math.floor(Date.now() / 1000),
+          model: String(req.body?.model ?? 'meeting'),
+          content: meetingResult?.choices?.[0]?.message?.content ?? '',
+          provider: 'meeting',
+        })) {
+          writeSse(res, chunk);
+        }
 
         finishSse(res);
         return;
@@ -2188,13 +760,57 @@ app.post('/v1/chat/completions', async (req, res) => {
       return;
     }
 
-    const provider = payload.provider ?? appConfig.defaultProvider;
-    const result = await completeWithProvider({
-      ...payload,
-      provider,
-      model: payload.model ?? `${provider}-web`,
-      messages: payload.messages,
-    });
+    const provider = resolveRequestProvider(payload) ?? appConfig.defaultProvider;
+    // dryRun 是调试路径，保持返回普通 JSON，不进 SSE。
+    const wantsStream = Boolean(payload.stream) && !payload.dryRun;
+
+    // 必须先发响应头再开始那段可能长达数分钟的等待，否则客户端会一直等首字节
+    // 而超时。头一发出去连接就建立了，后续写多少都不会被判定为无响应。
+    if (wantsStream) {
+      res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+      res.setHeader('Cache-Control', 'no-cache, no-transform');
+      res.setHeader('Connection', 'keep-alive');
+      res.flushHeaders?.();
+    }
+
+    const liveCompletionId = `chatcmpl-${Date.now()}`;
+    let liveStreamed = false;
+    const result = await completeWithProvider(
+      {
+        ...payload,
+        provider,
+        model: payload.model ?? `${provider}-web`,
+        messages: payload.messages,
+      },
+      wantsStream
+        ? {
+            onDelta: (delta) => {
+              if (liveStreamed) {
+                return;
+              }
+              liveStreamed = true;
+              writeSse(res, {
+                id: liveCompletionId,
+                object: 'chat.completion.chunk',
+                created: Math.floor(Date.now() / 1000),
+                model: payload.model ?? `${provider}-web`,
+                provider,
+                choices: [
+                  {
+                    index: 0,
+                    delta: {
+                      role: 'assistant',
+                      ...(delta.reasoningDelta ? { reasoning_content: delta.reasoningDelta } : {}),
+                      ...(delta.contentDelta ? { content: delta.contentDelta } : {}),
+                    },
+                    finish_reason: null,
+                  },
+                ],
+              });
+            },
+          }
+        : undefined,
+    );
 
     if (result.dryRun) {
       res.json({
@@ -2209,12 +825,35 @@ app.post('/v1/chat/completions', async (req, res) => {
       return;
     }
 
+    if (wantsStream) {
+      // 已经通过 onDelta 实时推过 delta 的话，就不要再把全文重推一遍。
+      const completionId = liveStreamed ? liveCompletionId : `chatcmpl-${Date.now()}`;
+      for (const chunk of buildChatCompletionChunks({
+        id: completionId,
+        created: Math.floor(Date.now() / 1000),
+        model: result.model,
+        provider,
+        conversationId: result.conversationId ?? null,
+        url: result.url,
+        content: result.content,
+        reasoningContent: result.reasoningContent,
+      })) {
+        writeSse(res, chunk);
+      }
+      finishSse(res);
+      return;
+    }
+
     res.json({
       id: `chatcmpl-${Date.now()}`,
       object: 'chat.completion',
       created: Math.floor(Date.now() / 1000),
       model: result.model,
       provider,
+      // 调用方没传 conversationId 时，这里是 bridge 从页面 URL 抽出的真实会话 id。
+      // 把它带回去再发下一次，就等于"继续这条对话"，bridge 会复用同一个标签页；
+      // 不带则表示"开新对话"，bridge 新建标签页并导航到新对话页。
+      conversationId: result.conversationId ?? null,
       choices: [
         {
           index: 0,
@@ -2230,7 +869,8 @@ app.post('/v1/chat/completions', async (req, res) => {
         url: result.url,
       },
       debug: result.debug,
-      usage: {
+      ...(result.capturedFromStream ? { capturedFromStream: true } : {}),
+      usage: result.usage ?? {
         prompt_tokens: 0,
         completion_tokens: 0,
         total_tokens: 0,
@@ -2248,19 +888,36 @@ app.post('/v1/chat/completions', async (req, res) => {
         res.setHeader('Connection', 'keep-alive');
         res.flushHeaders?.();
       }
-      writeSse(res, {
-        type: 'meeting.error',
-        error: {
-          message: `${message}；如果这是登录、风控、额度或网络问题，请查看已置前的浏览器页签并手动处理。`,
-        },
-      });
+      // 会议模式和非会议模式的错误帧形状不一样：
+      // 会议是 bridge 自己在编排多 provider，事件里带 type；
+      // 普通对话走 OpenAI 形状，错误放在 delta 里，否则按 OpenAI 协议解析的
+      // 客户端会收到一个没有 choices 的陌生事件而报错。
+      const detailedMessage = `${message}；如果这是登录、风控、额度或网络问题，请在控制台的「会话管理」里打开该 provider 的页面手动处理。`;
+      if (effectiveMeetingConversationId) {
+        writeSse(res, { type: 'meeting.error', error: { message: detailedMessage } });
+      } else {
+        writeSse(res, {
+          id: `chatcmpl-${Date.now()}`,
+          object: 'chat.completion.chunk',
+          created: Math.floor(Date.now() / 1000),
+          model: String(req.body?.model ?? appConfig.defaultProvider),
+          choices: [
+            {
+              index: 0,
+              delta: {},
+              finish_reason: 'stop',
+              error: { message: detailedMessage },
+            },
+          ],
+        });
+      }
       finishSse(res);
       return;
     }
 
     res.status(status).json({
       error: {
-        message: `${message}；如果这是登录、风控、额度或网络问题，请查看已置前的浏览器页签并手动处理。`,
+        message: `${message}；如果这是登录、风控、额度或网络问题，请在控制台的「会话管理」里打开该 provider 的页面手动处理。`,
       },
     });
   }

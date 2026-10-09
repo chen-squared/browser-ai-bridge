@@ -12,6 +12,32 @@ const selectorOverrideSchema = z.object({
   responseSelectors: z.array(z.string()).optional(),
   busySelectors: z.array(z.string()).optional(),
   url: z.string().optional(),
+  newChatUrl: z.string().optional(),
+  conversationUrlPattern: z.string().optional(),
+  /**
+   * 用户消息的祖先标记。凡是**同时**命中这些选择器的元素，都不当作模型回复。
+   *
+   * 有些站点给用户提问和 AI 回复共用同一个 class，只靠 responseSelectors 区分不开。
+   * 实测 Grok 就是这样：`.response-content-markdown` 同时命中两者，
+   * 于是"取最后一个可见块"会取到用户自己刚发的那句话——接口原样返回提示词。
+   * 有真流捕获时这个问题被掩盖了（流优先），一旦流捕获失败退回 DOM 就会暴露。
+   */
+  excludeUserMessageSelectors: z.array(z.string()).optional(),
+  streamCapture: z
+    .object({
+      endpointPattern: z.string(),
+      transport: z.enum(['http', 'websocket']),
+      /**
+       * 每个 reducer 对应一套协议，**不能跨 provider 复用**：
+       *   qwen     OpenAI 兼容 SSE，靠 phase 区分思考/正文
+       *   deepseek 带路径的补丁协议（p/o/v），先应用补丁再按 fragments[].type 分类
+       *   grok     WebSocket，OpenAI Responses 形状，靠 text.channel 区分，纯 token 追加
+       *   chatgpt  补丁协议（与 deepseek 同族但语义不同：空 p + add 是新增 message）
+       *   claude   会话快照 JSON，**不是 SSE**；它的 SSE 中文编码损坏，故不用
+       */
+      reducer: z.enum(['qwen', 'deepseek', 'grok', 'chatgpt', 'claude']),
+    })
+    .optional(),
   readyTimeoutMs: z.number().int().positive().optional(),
   submissionSignalTimeoutMs: z.number().int().positive().optional(),
   progressIdleTimeoutMs: z.number().int().positive().optional(),
@@ -39,6 +65,8 @@ const overridesFileSchema = z.record(z.enum(providerIds), selectorOverrideSchema
 const defaultProviders: Record<ProviderId, ProviderConfig> = {
   chatgpt: {
     id: 'chatgpt',
+    // 实测：https://chatgpt.com/c/<uuid>
+    conversationUrlPattern: '\\/c\\/([0-9a-f-]{20,})',
     label: 'ChatGPT',
     url: 'https://chatgpt.com/',
     urlPatterns: ['chatgpt.com'],
@@ -71,6 +99,14 @@ const defaultProviders: Record<ProviderId, ProviderConfig> = {
       'article[data-testid^="conversation-turn-"] [data-message-author-role="assistant"]',
     ],
     busySelectors: ['button[data-testid="stop-button"]'],
+    // 实测：POST /backend-api/f/conversation，返回 text/event-stream。
+    // 正文在 `event: delta` 的补丁帧里（p=/message/content/parts/0, o=append），
+    // 所以切帧必须 event/data 成对，不能只取块首的 data:。
+    streamCapture: {
+      endpointPattern: '\\/backend-api\\/f\\/conversation$',
+      transport: 'http',
+      reducer: 'chatgpt',
+    },
     toggles: {
       search: {
         buttonSelectors: [
@@ -91,6 +127,21 @@ const defaultProviders: Record<ProviderId, ProviderConfig> = {
   },
   gemini: {
     id: 'gemini',
+    // 实测：https://gemini.google.com/app/<id>
+    conversationUrlPattern: '\\/app\\/([A-Za-z0-9_-]{6,})',
+    // **尚未接入真流捕获**，故这里没有 streamCapture。原因见下：
+    //
+    // 端点已经找到——POST /_/BardChatUi/data/assistant.lamda.BardFrontendService/
+    // StreamGenerate，回包是 Google 的 batchexecute 封装（`)]}'` 前缀 + 长度前缀分帧 +
+    // 每帧 `["wrb.fr",null,"<转义后的JSON字符串>"]`）。技术上 body 能取到（它会正常结束），
+    // 正文就埋在那层转义 JSON 里。
+    //
+    // 但两件事挡住了：
+    //   1. 抓到的只有错误码 `BardErrorInfo [1099]` —— 账号配额已耗尽，连一个真实
+    //      答案样本都拿不到，归约器无法验证，只能靠猜Google 的内部结构写代码。
+    //   2. 这是 Google 私有格式，随意变；没有真实样本就没法确认写对了。
+    // 与其留一个没验证过的解析器，不如等配额重置、拿到样本再写。
+    // 在那之前 Gemini 走 DOM 路径。
     label: 'Gemini',
     url: 'https://gemini.google.com/app',
     urlPatterns: ['gemini.google.com'],
@@ -148,6 +199,9 @@ const defaultProviders: Record<ProviderId, ProviderConfig> = {
   },
   claude: {
     id: 'claude',
+    // 实测：https://claude.ai/chat/<uuid>（/new 不是会话页）
+    newChatUrl: 'https://claude.ai/new',
+    conversationUrlPattern: '\\/chat\\/([0-9a-f-]{20,})',
     label: 'Claude',
     url: 'https://claude.ai/new',
     urlPatterns: ['claude.ai'],
@@ -183,6 +237,14 @@ const defaultProviders: Record<ProviderId, ProviderConfig> = {
       '[data-is-streaming]',
     ],
     busySelectors: ['button[aria-label*="Stop response"]'],
+    // 实测：GET /api/organizations/{org}/chat_conversations/{id}，返回会话快照 JSON
+    // （chat_messages[].content[]），**不是 SSE**。
+    // 不用它的 SSE 是因为中文在 SSE 里编码损坏（UTF-8 被按 CP1252 误解码）。
+    streamCapture: {
+      endpointPattern: '\\/chat_conversations\\/',
+      transport: 'http',
+      reducer: 'claude',
+    },
     toggles: {
       search: {
         buttonSelectors: [
@@ -202,6 +264,18 @@ const defaultProviders: Record<ProviderId, ProviderConfig> = {
   },
   grok: {
     id: 'grok',
+    // 实测：https://grok.com/c/<uuid>
+    conversationUrlPattern: '\\/c\\/([0-9a-f-]{20,})',
+    // 实测：走 WebSocket wss://grok.com/ws/mgw/，帧是 OpenAI Responses API 形状
+    //（response.created / response.chunk / response.done）。
+    // 正文是纯 token 增量、只追加，因此不需要任何去重启发式；
+    // 思考与回答靠 chunk.text.channel 区分。
+    // 帧是实时事件，所以这条路径具备真首字延迟的可能。
+    streamCapture: {
+      endpointPattern: '\\/ws\\/mgw\\/',
+      transport: 'websocket',
+      reducer: 'grok',
+    },
     label: 'Grok',
     url: 'https://grok.com/',
     urlPatterns: ['grok.com'],
@@ -238,11 +312,14 @@ const defaultProviders: Record<ProviderId, ProviderConfig> = {
     ],
     submitWithEnterFallback: false,
     keyboardSubmitShortcuts: ['ControlOrMeta+Enter'],
-    responseSelectors: [
-      '.last-response .response-content-markdown',
-      '[data-testid="conversation-item-assistant"]',
-      '.response-content-markdown',
-    ],
+    responseSelectors: ['.last-response .response-content-markdown', '.response-content-markdown'],
+    // 实测：Grok 给用户提问和 AI 回复**共用 `.response-content-markdown`**，
+    // 唯一区别是用户气泡额外带 `data-testid="user-message"` 和
+    // `bg-surface-user-bubble`。不排除的话，"取最后一个可见块"拿到的是
+    // 用户自己刚发的那句话，接口就会原样返回提示词。
+    // （原先第一条 `[data-testid="conversation-item-assistant"]` 实测一个都匹配不到，
+    // 属于完全失效的选择器，已删除。）
+    excludeUserMessageSelectors: ['[data-testid="user-message"]', '.bg-surface-user-bubble'],
     busySelectors: ['button[aria-label*="Stop"]'],
     toggles: {
       search: {
@@ -263,6 +340,15 @@ const defaultProviders: Record<ProviderId, ProviderConfig> = {
   },
   qwen: {
     id: 'qwen',
+    // 实测：https://chat.qwen.ai/c/<uuid>
+    conversationUrlPattern: '\\/c\\/([0-9a-f-]{20,})',
+    // 实测：POST /api/v2/chat/completions?chat_id=...，返回 text/event-stream，
+    // 帧是 OpenAI 兼容形状，靠 phase 区分 thinking_summary 与 answer。
+    streamCapture: {
+      endpointPattern: '\\/api\\/v2\\/chat\\/completions',
+      transport: 'http',
+      reducer: 'qwen',
+    },
     label: 'Qwen',
     url: 'https://chat.qwen.ai/',
     urlPatterns: ['chat.qwen.ai'],
@@ -331,6 +417,16 @@ const defaultProviders: Record<ProviderId, ProviderConfig> = {
   },
   deepseek: {
     id: 'deepseek',
+    // 实测：https://chat.deepseek.com/a/chat/s/<uuid>
+    conversationUrlPattern: '\\/a\\/chat\\/s\\/([0-9a-f-]{20,})',
+    // 实测：POST /api/v0/chat/completion，返回 text/event-stream。
+    // 帧是**带路径的补丁协议**（p/o/v），不是裸 delta：先应用补丁得到最终状态，
+    // 再按 fragments[].type 区分 THINK / RESPONSE。因此不需要任何去重启发式。
+    streamCapture: {
+      endpointPattern: '\\/api\\/v0\\/chat\\/completion',
+      transport: 'http',
+      reducer: 'deepseek',
+    },
     label: 'DeepSeek',
     url: 'https://chat.deepseek.com/',
     urlPatterns: ['chat.deepseek.com'],
