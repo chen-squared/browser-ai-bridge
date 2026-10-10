@@ -704,6 +704,67 @@
         }
       }
 
+      /* 缺令牌时的遮罩。理由同控制台：页面打得开但接口全 401，
+         不提前说清楚的话，用户只会看到点了没反应。 */
+      .token-gate {
+        position: fixed;
+        inset: 0;
+        z-index: 60;
+        display: none;
+        align-items: center;
+        justify-content: center;
+        padding: 24px;
+        background: rgba(8, 11, 16, 0.94);
+      }
+
+      .token-gate[data-show='true'] {
+        display: flex;
+      }
+
+      .token-card {
+        width: 100%;
+        max-width: 420px;
+        padding: 22px;
+        border: 1px solid var(--line-hi);
+        border-radius: 12px;
+        background: var(--panel);
+      }
+
+      .token-card h2 {
+        margin: 0 0 8px;
+        font-size: 17px;
+      }
+
+      .token-card p {
+        margin: 0 0 14px;
+        color: var(--ink-dim);
+        font-size: 13px;
+        line-height: 1.6;
+      }
+
+      .token-card input {
+        width: 100%;
+        padding: 9px 11px;
+        border: 1px solid var(--line-hi);
+        border-radius: 8px;
+        background: var(--bg);
+        color: var(--ink);
+        font-family: var(--mono);
+        font-size: 13px;
+      }
+
+      .token-actions {
+        display: flex;
+        gap: 8px;
+        margin-top: 12px;
+      }
+
+      .token-err {
+        margin-top: 10px;
+        color: var(--danger);
+        font-size: 12px;
+      }
+
       @media (max-width: 760px) {
         .app {
           grid-template-columns: 1fr;
@@ -731,6 +792,19 @@
     <script src="/vendor/marked/marked.umd.js"></script>
   </head>
   <body>
+    <div class="token-gate" id="tokenGate">
+      <div class="token-card">
+        <h2>需要访问令牌</h2>
+        <p>这台 bridge 能操控已登录的网页账号，所以开了令牌校验。粘到下面再进。</p>
+        <input id="tokenInput" type="text" placeholder="粘贴 BRIDGE_TOKEN" />
+        <div class="token-actions">
+          <button class="primary" id="tokenSaveBtn">进入</button>
+          <button class="ghost" id="tokenSkipBtn">先看看</button>
+        </div>
+        <div class="token-err" id="tokenErr"></div>
+      </div>
+    </div>
+
     <div class="app">
       <aside class="sidebar" id="sidebar">
         <div class="sidebar-head">
@@ -876,10 +950,58 @@
           /* 不是 JSON 就按原文 */
         }
         if (!response.ok) {
-          throw new Error(payload?.error?.message || text || `HTTP ${response.status}`);
+          const message = payload?.error?.message || text || `HTTP ${response.status}`;
+          if (/BRIDGE_TOKEN|令牌/.test(String(message))) {
+            showTokenGate(message);
+          }
+          throw new Error(message);
         }
         return payload;
       }
+
+      function showTokenGate(message) {
+        $('tokenGate').dataset.show = 'true';
+        $('tokenErr').textContent = message || '';
+        const input = $('tokenInput');
+        if (!input.value) {
+          input.value = token();
+        }
+        input.focus();
+      }
+
+      function hideTokenGate() {
+        $('tokenGate').dataset.show = 'false';
+      }
+
+      $('tokenSaveBtn').addEventListener('click', async () => {
+        const value = $('tokenInput').value.trim();
+        if (!value) {
+          $('tokenErr').textContent = '请先粘贴令牌。';
+          return;
+        }
+        try {
+          const probe = await fetch('/sessions', { headers: { 'x-bridge-token': value } });
+          if (!probe.ok) {
+            throw new Error('令牌无效（HTTP ' + probe.status + '）');
+          }
+          try {
+            sessionStorage.setItem('bridge.token', value);
+          } catch {
+            /* 隐私模式下写不了；内存里的这份本次会话仍然有效 */
+          }
+          hideTokenGate();
+          loadHistory();
+        } catch (error) {
+          $('tokenErr').textContent = String(error.message).slice(0, 140);
+        }
+      });
+
+      $('tokenSkipBtn').addEventListener('click', hideTokenGate);
+      $('tokenInput').addEventListener('keydown', (event) => {
+        if (event.key === 'Enter') {
+          $('tokenSaveBtn').click();
+        }
+      });
 
       function setStatus(tone, message) {
         const node = $('status');
@@ -1422,7 +1544,11 @@
         }
         summarizer.value = state.summarizer;
         await refreshSeatNames();
-        loadHistory();
+        if (token()) {
+          loadHistory();
+        } else {
+          showTokenGate('尚未提供访问令牌，所有接口都会返回 401。');
+        }
       })();
     </script>
   </body>

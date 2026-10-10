@@ -5,6 +5,68 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>browser-ai-bridge</title>
     <style>
+      /* 缺令牌时的遮罩。原先只有接口返回 401，用户是点了会话/发送之后才看到
+         "缺少 BRIDGE_TOKEN"——不知道该做什么。改成进来就明确告诉他在哪填。 */
+      .token-gate {
+        position: fixed;
+        inset: 0;
+        z-index: 100;
+        display: none;
+        align-items: center;
+        justify-content: center;
+        padding: 24px;
+        background: rgba(8, 11, 16, 0.94);
+        backdrop-filter: blur(6px);
+      }
+
+      .token-gate[data-show='true'] {
+        display: flex;
+      }
+
+      .token-card {
+        width: 100%;
+        max-width: 420px;
+        padding: 22px;
+        border: 1px solid var(--line-hi);
+        border-radius: 12px;
+        background: var(--panel);
+      }
+
+      .token-card h2 {
+        margin: 0 0 8px;
+        font-size: 17px;
+      }
+
+      .token-card p {
+        margin: 0 0 14px;
+        color: var(--ink-dim);
+        font-size: 13px;
+        line-height: 1.6;
+      }
+
+      .token-card input {
+        width: 100%;
+        padding: 9px 11px;
+        border: 1px solid var(--line-hi);
+        border-radius: 8px;
+        background: var(--bg);
+        color: var(--ink);
+        font-family: var(--mono);
+        font-size: 13px;
+      }
+
+      .token-actions {
+        display: flex;
+        gap: 8px;
+        margin-top: 12px;
+      }
+
+      .token-err {
+        margin-top: 10px;
+        color: var(--danger);
+        font-size: 12px;
+      }
+
       /* ── 设计基调 ──────────────────────────────────────────────
          深色为主、留白克制、等宽字体只用在技术标识上。
          配色刻意压低饱和度，正文对比度按 WCAG AA 以上配，
@@ -72,6 +134,7 @@
         display: flex;
         align-items: center;
         gap: 9px;
+        flex: none;
         font-weight: 600;
         letter-spacing: -0.01em;
         white-space: nowrap;
@@ -93,11 +156,23 @@
         display: flex;
         gap: 2px;
         height: 100%;
+        /* 放不下时横向滚动，而不是把每个 tab 压扁 */
+        min-width: 0;
+        overflow-x: auto;
+        scrollbar-width: none;
+      }
+
+      .tabs::-webkit-scrollbar {
+        display: none;
       }
 
       .tab {
         display: flex;
         align-items: center;
+        /* 不折行。窄屏下不写这条，文字会被挤成竖排（一列一个字），
+           高度撑破顶栏，最右边那个还够不着。 */
+        white-space: nowrap;
+        flex: none;
         padding: 0 14px;
         border: none;
         border-bottom: 2px solid transparent;
@@ -123,6 +198,7 @@
       .health {
         display: inline-flex;
         align-items: center;
+        flex: none;
         gap: 6px;
         padding: 4px 10px;
         border: 1px solid var(--line);
@@ -749,6 +825,25 @@
         line-height: 1.45;
       }
 
+      @media (max-width: 620px) {
+        .topbar {
+          gap: 8px;
+          padding: 0 10px;
+        }
+
+        /* 品牌名和健康文字先让位——手机上顶栏宽度紧张，
+           优先保证四个标签都能横向滑动到 */
+        .brand-name,
+        #healthText {
+          display: none;
+        }
+
+        .tab {
+          padding: 0 10px;
+          font-size: 13px;
+        }
+      }
+
       @media (max-width: 880px) {
         .split {
           grid-template-columns: 1fr;
@@ -766,7 +861,7 @@
   </head>
   <body>
     <header class="topbar">
-      <div class="brand"><span class="brand-mark"></span>browser-ai-bridge</div>
+      <div class="brand"><span class="brand-mark"></span><span class="brand-name">browser-ai-bridge</span></div>
       <nav class="tabs" role="tablist">
         <button class="tab" role="tab" data-view="playground" aria-selected="true">并排对比</button>
         <a class="tab" href="/meeting">会议</a>
@@ -778,6 +873,23 @@
         ><span class="dot"></span><span id="healthText">连接中…</span></span
       >
     </header>
+
+    <div class="token-gate" id="tokenGate">
+      <div class="token-card">
+        <h2>需要访问令牌</h2>
+        <p>
+          这台 bridge 能操控已登录的网页账号，所以开了令牌校验。你可以在
+          Mac 上运行下面这条命令拿到令牌，粘到下面再进：
+        </p>
+        <p><code class="mono">cat ~/…/opencode/bridge-token.txt</code></p>
+        <input id="tokenInput" type="text" placeholder="粘贴 BRIDGE_TOKEN" />
+        <div class="token-actions">
+          <button class="primary" id="tokenSaveBtn">进入</button>
+          <button class="ghost" id="tokenSkipBtn">先看看</button>
+        </div>
+        <div class="token-err" id="tokenErr"></div>
+      </div>
+    </div>
 
     <div class="shell">
       <!-- ══ 并排对比 ══════════════════════════════════════════ -->
@@ -1014,10 +1126,62 @@
             (payload && payload.error && payload.error.message) ||
             (typeof payload === 'string' ? payload : '') ||
             'HTTP ' + response.status;
+          if (/BRIDGE_TOKEN|令牌/.test(String(message))) {
+            showTokenGate(message);
+          }
           throw new Error(message);
         }
         return payload;
       }
+
+      /* ── 令牌闸门 ─────────────────────────────────────────────
+         没令牌时页面本身打得开（服务端放行静态页），但所有接口都会 401。
+         原来只有点了会话、点了发送之后才看到那句报错，用户不知道该做什么；
+         所以改成进来就明确告诉他在哪填，并且把入口一直摆在屏上。
+      ─────────────────────────────────────────────────────── */
+      function showTokenGate(message) {
+        $('tokenGate').dataset.show = 'true';
+        $('tokenErr').textContent = message || '';
+        const input = $('tokenInput');
+        if (!input.value) {
+          input.value = readBridgeToken();
+        }
+        input.focus();
+      }
+
+      function hideTokenGate() {
+        $('tokenGate').dataset.show = 'false';
+      }
+
+      $('tokenSaveBtn').addEventListener('click', async () => {
+        const value = $('tokenInput').value.trim();
+        if (!value) {
+          $('tokenErr').textContent = '请先粘贴令牌。';
+          return;
+        }
+        try {
+          const probe = await fetch('/sessions', { headers: { 'x-bridge-token': value } });
+          if (!probe.ok) {
+            throw new Error('令牌无效（HTTP ' + probe.status + '）');
+          }
+          try {
+            sessionStorage.setItem('bridge.token', value);
+          } catch {
+            /* 隐私模式下写不了；内存里的这份本次会话仍然有效 */
+          }
+          hideTokenGate();
+          await loadSessionView();
+        } catch (error) {
+          $('tokenErr').textContent = String(error.message).slice(0, 140);
+        }
+      });
+
+      $('tokenSkipBtn').addEventListener('click', hideTokenGate);
+      $('tokenInput').addEventListener('keydown', (event) => {
+        if (event.key === 'Enter') {
+          $('tokenSaveBtn').click();
+        }
+      });
 
       /* ── 流式读取 ──────────────────────────────────────────────
          按 \n\n 切事件块。**必须按 code point 而不是 UTF-16 单元切**，
@@ -1195,7 +1359,7 @@
         time.className = 'answer-time';
         head.append(name, time);
 
-        const entry = { node: card, body: null, thinking: null, time, text: '' };
+        const entry = { node: card, body: null, thinking: null, time, text: '', empty: false };
         const thinking = document.createElement('details');
         thinking.className = 'thinking';
         thinking.hidden = true;
@@ -1217,6 +1381,13 @@
         entry.body = body;
         answers.set(id, entry);
         return entry;
+      }
+
+      /** 下拉框的三态 → 请求字段：'auto' 表示不干预，传 undefined。 */
+      function searchFlag(value) {
+        if (value === 'on') return true;
+        if (value === 'off') return false;
+        return undefined;
       }
 
       function setStatus(node, tone, message) {
@@ -1292,13 +1463,20 @@
           const body = answers.get(id)?.body;
           return body && body.querySelector('.status[data-tone="err"]');
         });
+        const empty = picked.filter((id) => answers.get(id)?.empty);
         const total = ((Date.now() - started) / 1000).toFixed(1);
+        const parts = [`用时 ${total}s`];
+        if (failed.length) {
+          parts.push(`${failed.map((f) => LABELS[f] || f).join('、')} 失败`);
+        }
+        if (empty.length) {
+          // 空回答要说出来。混在"全部完成"里的话，空白卡片会被当成正常结果。
+          parts.push(`${empty.map((f) => LABELS[f] || f).join('、')} 返回空回答`);
+        }
         setStatus(
           $('playStatus'),
-          failed.length ? 'warn' : 'ok',
-          failed.length
-            ? `完成，用时 ${total}s；${failed.map((f) => LABELS[f] || f).join('、')} 失败。`
-            : `全部完成，用时 ${total}s。`,
+          failed.length || empty.length ? 'warn' : 'ok',
+          parts.length > 1 ? `${parts[0]}；${parts.slice(1).join('；')}。` : `全部完成，${parts[0]}。`,
         );
       }
 
@@ -1308,8 +1486,11 @@
           model: id + '-web',
           messages: [{ role: 'user', content: $('prompt').value.trim() }],
           stream: true,
-          enableSearch: $('searchMode').value === 'on' ? undefined : $('searchMode').value,
-          enableReasoning: $('reasoningMode').value === 'on' ? undefined : $('reasoningMode').value,
+          // schema 要的是 boolean，这里原来直接传 'on'/'off'/'auto' 字符串，
+          // 选「off」或「auto」就会被 Zod 拒掉（invalid_type: expected boolean）。
+          // 'auto' = 不传这个字段，保持网页当前状态。
+          enableSearch: searchFlag($('searchMode').value),
+          enableReasoning: searchFlag($('reasoningMode').value),
         };
         const existingConv = loadConv(id);
         if (existingConv) {
@@ -1351,9 +1532,17 @@
 
         entry.body.classList.remove('caret');
         entry.text = text;
-        entry.body.innerHTML = window.marked
-          ? window.marked.parse(text || '_（空回答）_')
-          : escapeHtml(text || '（空回答）');
+        entry.empty = text.trim() === '';
+        // 空回答必须**看得见**。原先只渲染一行斜体的「（空回答）」，在一张
+        // 正常样式的卡片里几乎注意不到，而顶部状态又说"全部完成"——用户会
+        // 以为是自己看漏了。所以改成醒目的状态条，并计入汇总。
+        entry.body.innerHTML = entry.empty
+          ? '<div class="status" data-tone="warn">模型返回了空回答。多为站点偶发，' +
+            '重新发一次通常就好；若连续出现，用「诊断」页看看该 provider 的' +
+            '真流捕获是否还在工作。</div>'
+          : window.marked
+            ? window.marked.parse(text)
+            : escapeHtml(text);
 
         if (conv) {
           $('conversationId').value = conv;
@@ -1515,6 +1704,11 @@
 
         await refreshHealth();
         setInterval(refreshHealth, 20000);
+
+        // 没令牌就别让人先去点会话撞 401
+        if (!readBridgeToken()) {
+          showTokenGate('尚未提供访问令牌，所有接口都会返回 401。');
+        }
       }
 
       boot();

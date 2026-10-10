@@ -395,10 +395,15 @@ if (corsOrigin) {
 }
 
 // 3) 可选 token：未配置时完全不影响现有行为。
-//    /health 和控制台本体放行，否则健康检查和首次打开页面会直接不可用。
+//    页面本体放行，否则没带 token 打开链接只会看到一段 401 的 JSON，而不是页面
+//    上那句"需要令牌"的提示——页面自己会在发请求前检查并给出可点的入口。
+//    注意这只放行**静态页面**，任何带数据的接口仍然要 token。
 if (appConfig.bridgeToken) {
   const isPublicPath = (pathname: string) =>
-    pathname === '/health' || pathname === '/' || pathname.startsWith('/vendor/');
+    pathname === '/health' ||
+    pathname === '/' ||
+    pathname === '/meeting' ||
+    pathname.startsWith('/vendor/');
 
   app.use((req, res, next) => {
     if (isPublicPath(req.path)) {
