@@ -73,8 +73,11 @@ const overridesFileSchema = z.record(z.enum(providerIds), selectorOverrideSchema
 const defaultProviders: Record<ProviderId, ProviderConfig> = {
   chatgpt: {
     id: 'chatgpt',
-    // 实测：https://chatgpt.com/c/<uuid>
-    conversationUrlPattern: '\\/c\\/([0-9a-f-]{20,})',
+    // 实测：https://chatgpt.com/c/<uuid>；新版本地会话是
+    // https://chatgpt.com/c/local-chatgpt%3A<uuid>（前缀里的冒号被 URL 编码）。
+    // 旧模式要求 /c/ 后面紧跟十六进制，于是本地会话一个都匹配不上，
+    // conversationId 恒为 null，多轮对话直接断掉。
+    conversationUrlPattern: '\\/c\\/(?:local-chatgpt(?::|%3A))?([0-9a-f-]{20,})',
     label: 'ChatGPT',
     url: 'https://chatgpt.com/',
     urlPatterns: ['chatgpt.com'],

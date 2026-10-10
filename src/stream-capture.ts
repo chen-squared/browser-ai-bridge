@@ -788,6 +788,26 @@ export function reduceChatgptStream(frames: readonly string[]): ReducedStream | 
       return message;
     };
 
+    // 批量补丁。实测见过两种形状，都不带顶层 `p`：
+    //   {"o":"patch","v":[{p,o,v},…]}  —— 带 o
+    //   {"v":[{p,o,v},…]}              —— 连 o 都没有（2026-10 起的形状）
+    // 旧实现要求 `p === ''`，两种一个都匹配不上，于是 append 补丁全被丢掉，
+    // 抓到的流只剩第一帧快照里的那几个字（实测「冬天的早晨，」）。
+    if ((path === undefined || path === '') && Array.isArray(value)) {
+      sawFrame = true;
+      for (const item of value) {
+        if (!item || typeof item !== 'object') {
+          continue;
+        }
+        const patch = item as { p?: string; o?: string; v?: unknown };
+        const index = lastIndex('assistant');
+        if (index >= 0 && patch.p) {
+          applyPatch(messages[index], patch.p, patch.o, patch.v);
+        }
+      }
+      return;
+    }
+
     // 整条新增 message
     if (path === '' && op === 'add' && value && typeof value === 'object') {
       const message = fromSnapshot(value);

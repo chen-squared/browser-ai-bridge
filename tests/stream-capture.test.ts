@@ -587,6 +587,38 @@ describe('reduceChatgptStream', () => {
     assert.equal(reduceChatgptStream([snapshot]), undefined);
   });
 
+  it('批次补丁：{"o":"patch","v":[…]}（带 o、无 p）也认', () => {
+    const answer = reduceChatgptStream([
+      JSON.stringify({
+        v: { message: { author: { role: 'assistant' }, content: { parts: ['好的，'] } } },
+      }),
+      JSON.stringify({
+        o: 'patch',
+        v: [
+          { p: '/message/content/parts/0', o: 'append', v: '以' },
+          { p: '/message/status', o: 'replace', v: 'finished_successfully' },
+        ],
+      }),
+    ]);
+
+    assert.equal(answer?.content, '好的，以');
+  });
+
+  it('批次补丁：{"v":[…]}（连 o 都没有）也认', () => {
+    // 这是 2026-10 实测的形状。旧实现要求顶层 p === ''，这一种直接被丢掉，
+    // 抓到的流只剩第一帧快照里的那几个字。
+    const answer = reduceChatgptStream([
+      JSON.stringify({
+        v: { message: { author: { role: 'assistant' }, content: { parts: ['冬天的早晨，'] } } },
+      }),
+      JSON.stringify({
+        v: [{ p: '/message/content/parts/0', o: 'append', v: '天空灰蒙蒙的，' }],
+      }),
+    ]);
+
+    assert.equal(answer?.content, '冬天的早晨，天空灰蒙蒙的，');
+  });
+
   function reducedId() {
     return reduceChatgptStream(frames)?.conversationId;
   }
@@ -623,6 +655,44 @@ describe('ChatGPT —— 真实流捕获（2026-10 实测）', () => {
     // 取错了就会把刚发出去的那句话原样返回。
     const reduced = reduceChatgptStream(parseSseEvents(REAL).map((event) => event.data));
     assert.notEqual(reduced?.content, '用两字形容雪');
+  });
+});
+
+describe('ChatGPT —— 首帧快照 + 后续 append 补丁（2026-10 实测）', () => {
+  /** 长回答：首帧给一句开头，后面全是 append 补丁。只认快照就会只拿到开头。 */
+  const REAL = readFileSync(
+    new URL('./fixtures/chatgpt-patch-stream.txt', import.meta.url),
+    'utf8',
+  );
+
+  it('拼回完整的三段正文', () => {
+    const reduced = reduceChatgptStream(parseSseEvents(REAL).map((event) => event.data));
+    assert.equal(
+      reduced?.content,
+      '冬天的早晨，天空灰蒙蒙的，寒风轻轻吹过，空气中透着丝丝凉意。  \n树枝上挂着晶莹的霜花，屋顶和草地都披上了一层洁白的薄霜。  \n太阳慢慢升起，金色的阳光洒向大地，为寒冷的冬日增添了一丝温暖。',
+    );
+  });
+
+  it('认出结束', () => {
+    const reduced = reduceChatgptStream(parseSseEvents(REAL).map((event) => event.data));
+    assert.equal(reduced?.finished, true);
+  });
+
+  it('只喂首帧快照时只能得到开头——补丁丢了不会假装答完了', () => {
+    const frames = parseSseEvents(REAL);
+    const firstAnswer = frames.findIndex((event) => {
+      try {
+        const frame = JSON.parse(event.data);
+        return frame?.v?.message?.author?.role === 'assistant' && Array.isArray(frame.v.message.content?.parts);
+      } catch {
+        return false;
+      }
+    });
+    assert.ok(firstAnswer > 0, '真实流里应当有首帧的 assistant 快照');
+
+    const partial = reduceChatgptStream(frames.slice(0, firstAnswer + 1).map((event) => event.data));
+    assert.equal(partial?.content, '冬天的早晨，');
+    assert.equal(partial?.finished, false, '还没收到结束帧，不能算 finished');
   });
 });
 
