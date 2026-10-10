@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -8,7 +9,9 @@ import { appConfig } from './config.js';
 import { BrowserManager } from './browser/browser-manager.js';
 import { ProviderClient } from './browser/provider-client.js';
 import { normalizeMessages } from './prompt.js';
+import { detectHumanVerificationOnPage } from './browser/human-verification.js';
 import { createSyncPlan } from './session-sync.js';
+import { MeetingStore, type MeetingEntry, type MeetingRecord } from './meeting-store.js';
 import { buildChatCompletionChunks } from './sse-chunks.js';
 import { buildAllowedHosts, extractToken, isAllowedHost, isTokenValid } from './http-access.js';
 import {
@@ -70,6 +73,26 @@ const requestSchema = z.object({
     .optional(),
 });
 
+const providerIdSchema = z.enum(['chatgpt', 'gemini', 'claude', 'grok', 'qwen', 'deepseek']);
+
+const meetingCreateSchema = z.object({
+  title: z.string().max(200).optional(),
+  mode: z.enum(['round-robin', 'parallel']).optional(),
+  participants: z.array(providerIdSchema).min(2).max(6),
+  summarizer: providerIdSchema,
+  summarizerSeat: z.string().max(32).optional(),
+  rounds: z.number().int().min(1).max(4).optional(),
+});
+
+const meetingUpdateSchema = z.object({
+  title: z.string().min(1).max(200).optional(),
+  mode: z.enum(['round-robin', 'parallel']).optional(),
+  participants: z.array(providerIdSchema).min(2).max(6).optional(),
+  summarizer: providerIdSchema.optional(),
+  summarizerSeat: z.string().max(32).optional(),
+  rounds: z.number().int().min(1).max(4).optional(),
+});
+
 /** `/meeting/plan` 的入参：只要编排相关的字段，其余一律不接受。 */
 const meetingPlanSchema = z.object({
   template: z.string().min(1),
@@ -83,6 +106,59 @@ const meetingPlanSchema = z.object({
 });
 
 type CompletionPayload = z.infer<typeof requestSchema>;
+
+const PROVIDER_IDS = ['chatgpt', 'gemini', 'claude', 'grok', 'qwen', 'deepseek'] as const;
+
+function isProviderId(value: unknown): value is ProviderId {
+  return typeof value === 'string' && (PROVIDER_IDS as readonly string[]).includes(value);
+}
+
+function createMeetingId(): string {
+  return `meeting-${randomUUID()}`;
+}
+
+/** 会议存储只初始化一次。 */
+let meetingStorePromise: Promise<MeetingStore> | undefined;
+function meetingStore(): Promise<MeetingStore> {
+  meetingStorePromise ??= MeetingStore.open(appConfig.meetingStorePath);
+  return meetingStorePromise;
+}
+
+/**
+ * 把这一轮的发言落进会议记录。
+ *
+ * 只存本轮新增的（`turnEntries`），不是整场 transcript——否则多轮时每轮都会把
+ * 历史再叠一遍，历史越来越长且出现重复。
+ */
+function recordTurn(
+  store: MeetingStore,
+  meetingId: string,
+  userMessage: string,
+  response: { meeting?: { turnEntries?: MeetingEntry[] } } | null | undefined,
+): void {
+  const entries = response?.meeting?.turnEntries ?? [];
+  if (!userMessage && entries.length === 0) {
+    return;
+  }
+  store.appendTurn(meetingId, { userMessage, entries });
+}
+
+/** 列表只给摘要，完整 transcript 走 /meetings/:id，避免列表过大。 */
+function toMeetingSummary(record: MeetingRecord) {
+  return {
+    id: record.id,
+    title: record.title,
+    mode: record.mode,
+    participants: record.participants,
+    summarizer: record.summarizer,
+    summarizerSeat: record.summarizerSeat,
+    rounds: record.rounds,
+    turns: record.turns.length,
+    createdAt: record.createdAt,
+    updatedAt: record.updatedAt,
+    preview: record.turns.at(-1)?.userMessage ?? '',
+  };
+}
 
 function listChatModels() {
   const providerModels = listProviders().map((provider) => ({
@@ -140,10 +216,15 @@ async function completeWithProvider(
     throw new Error('至少需要一条 user 消息');
   }
 
-  const client = new ProviderClient(provider, {
-    take: (page, since) => browserManager.takeCapturedStream(page, provider, since),
-    frames: (page, since) => browserManager.streamFrames(page, provider, since),
-  });
+  const client = new ProviderClient(
+    provider,
+    {
+      take: (page, since) => browserManager.takeCapturedStream(page, provider, since),
+      frames: (page, since) => browserManager.streamFrames(page, provider, since),
+    },
+    // 第三个参数：只用于人机验证——那种情况只能由人点，必须弹到前台
+    (page) => browserManager.bringPageToFront(page),
+  );
   const hasExistingSession = browserManager.hasSession(provider, payload.conversationId);
   const desiredPromptMode = resolvePromptMode(payload);
   const cachedMessages = browserManager.getSyncedMessages(provider, payload.conversationId);
@@ -267,7 +348,9 @@ const app = express();
 const runtimeDir = path.dirname(fileURLToPath(import.meta.url));
 const markedVendorDir = path.resolve(runtimeDir, '../node_modules/marked/lib');
 const consoleHtmlPath = path.resolve(runtimeDir, 'console/index.html');
+const meetingHtmlPath = path.resolve(runtimeDir, 'console/meeting.html');
 const CONSOLE_HTML = readFileSync(consoleHtmlPath, 'utf8');
+const MEETING_HTML = readFileSync(meetingHtmlPath, 'utf8');
 
 // 1) Host 白名单：防 DNS rebinding。
 //    只监听 127.0.0.1 并不能自保——浏览器按主机名判断同源，恶意域名解析到
@@ -490,6 +573,16 @@ app.get('/', (_req, res) => {
   res.type('html').send(CONSOLE_HTML);
 });
 
+/**
+ * 会议页单独一个入口，不塞进控制台的标签里。
+ *
+ * 两者的形态不同：控制台是多模型并排比对的工具台，会议是provider 那种
+ * 一条时间线上的对话（有历史记录、可多轮）。混在一个页面里两头都不好用。
+ */
+app.get('/meeting', (_req, res) => {
+  res.type('html').send(MEETING_HTML);
+});
+
 app.get('/health', async (_req, res) => {
   res.json({
     ok: true,
@@ -625,7 +718,18 @@ app.get('/session/:provider/inspect', async (req, res) => {
     const payload = await browserManager.inspectSession(provider, resolvedConversationId, {
       hoverLatestResponse,
     });
-    res.json({ ok: true, provider, conversationId, resolvedConversationId, ...payload });
+    // 顺手报一下是否卡在人机验证上：这类拦截从正文看不出来，
+    // 但排查"怎么发不出去"时它是最常见的原因之一。
+    const peek = await browserManager.peekPage(provider, resolvedConversationId);
+    const verification = peek ? await detectHumanVerificationOnPage(peek) : null;
+    res.json({
+      ok: true,
+      provider,
+      conversationId,
+      resolvedConversationId,
+      ...(verification ? { verification } : {}),
+      ...payload,
+    });
   } catch (error) {
     const message = error instanceof Error ? error.message : '调试页面失败';
     res.status(400).json({ error: { message } });
@@ -653,10 +757,14 @@ app.post('/session/:provider/extract-latest', async (req, res) => {
     if (conversationId && !resolvedConversationId) {
       throw new Error(`未找到 ${provider} 的现有会话: ${conversationId}`);
     }
-    const client = new ProviderClient(provider, {
-      take: (page, since) => browserManager.takeCapturedStream(page, provider, since),
-      frames: (page, since) => browserManager.streamFrames(page, provider, since),
-    });
+    const client = new ProviderClient(
+      provider,
+      {
+        take: (page, since) => browserManager.takeCapturedStream(page, provider, since),
+        frames: (page, since) => browserManager.streamFrames(page, provider, since),
+      },
+      (page) => browserManager.bringPageToFront(page),
+    );
     const latestAssistantHint = browserManager
       .getSyncedMessages(provider, resolvedConversationId)
       .slice()
@@ -697,6 +805,71 @@ app.post('/session/:provider/clear', async (req, res) => {
   }
 });
 
+/**
+ * 会议记录。
+ *
+ * 会议的多轮与留记录全靠这里——网页侧的会话只是"当次编排用到的标签页"，
+ * 不是会议本身。会议记录只存在于 bridge 这一侧。
+ */
+app.get('/meetings', async (_req, res) => {
+  const store = await meetingStore();
+  res.json({ meetings: store.list().map(toMeetingSummary) });
+});
+
+app.post('/meetings', async (req, res) => {
+  const body = meetingCreateSchema.safeParse(req.body ?? {});
+  if (!body.success) {
+    res.status(400).json({ error: { message: body.error.issues[0]?.message ?? '参数不合法' } });
+    return;
+  }
+  const store = await meetingStore();
+  const record = store.create({
+    id: createMeetingId(),
+    title: body.data.title?.trim() || '未命名会议',
+    mode: body.data.mode ?? 'round-robin',
+    participants: body.data.participants,
+    summarizer: body.data.summarizer,
+    summarizerSeat: body.data.summarizerSeat ?? '',
+    rounds: body.data.rounds ?? 1,
+  });
+  res.json({ meeting: record });
+});
+
+app.get('/meetings/:id', async (req, res) => {
+  const store = await meetingStore();
+  const record = store.get(req.params.id);
+  if (!record) {
+    res.status(404).json({ error: { message: `找不到会议: ${req.params.id}` } });
+    return;
+  }
+  res.json({ meeting: record });
+});
+
+/** 改标题或编排配置。改编排不影响已发生的轮次，只影响下一轮起。 */
+app.patch('/meetings/:id', async (req, res) => {
+  const body = meetingUpdateSchema.safeParse(req.body ?? {});
+  if (!body.success) {
+    res.status(400).json({ error: { message: body.error.issues[0]?.message ?? '参数不合法' } });
+    return;
+  }
+  const store = await meetingStore();
+  const record = store.update(req.params.id, body.data);
+  if (!record) {
+    res.status(404).json({ error: { message: `找不到会议: ${req.params.id}` } });
+    return;
+  }
+  res.json({ meeting: record });
+});
+
+app.delete('/meetings/:id', async (req, res) => {
+  const store = await meetingStore();
+  if (!store.remove(req.params.id)) {
+    res.status(404).json({ error: { message: `找不到会议: ${req.params.id}` } });
+    return;
+  }
+  res.json({ ok: true });
+});
+
 app.post('/v1/chat/completions', async (req, res) => {
   let effectiveMeetingConversationId: string | undefined;
 
@@ -704,6 +877,28 @@ app.post('/v1/chat/completions', async (req, res) => {
     const payload = requestSchema.parse(req.body);
     const meetingTemplate = resolveMeetingTemplate(payload.model);
     if (meetingTemplate) {
+      // 会议要留记录、能多轮，所以先把这一轮的上下文准备好：
+      // 已有会议取回之前的发言（多轮的关键），新会议先落一条空记录拿到 id。
+      const store = await meetingStore();
+      const latestUserMessage =
+        [...payload.messages].reverse().find((message) => message.role === 'user')?.content ?? '';
+
+      const requestedId = payload.conversationId;
+      const existing = requestedId ? store.get(requestedId) : undefined;
+      const record =
+        existing ??
+        store.create({
+          id: requestedId && requestedId.startsWith('meeting-') ? requestedId : createMeetingId(),
+          title: '未命名会议',
+          mode: meetingTemplate.mode,
+          participants: (payload.meeting?.participants ?? []).filter(isProviderId),
+          summarizer: payload.meeting?.summarizer ?? meetingTemplate.summarizer.provider,
+          summarizerSeat: payload.meeting?.summarizerSeat ?? '',
+          rounds: payload.meeting?.rounds ?? meetingTemplate.rounds,
+        });
+
+      const priorTranscript = store.transcriptOf(record.id);
+
       if (payload.stream) {
         res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
         res.setHeader('Cache-Control', 'no-cache, no-transform');
@@ -715,10 +910,11 @@ app.post('/v1/chat/completions', async (req, res) => {
         // finishSse，客户端于是只看到一堆 meeting.entry，永远等不到总结。
         // 表现就是"会议跑完了但没有答复"。
         const meetingResult = await runMeetingCompletion(
-          payload,
+          { ...payload, conversationId: record.id },
           meetingTemplate,
           completeWithProvider,
           {
+            priorTranscript,
             onProgress: async (event) => {
               if (event.type === 'meeting.started') {
                 effectiveMeetingConversationId = event.meeting.conversationId;
@@ -728,6 +924,8 @@ app.post('/v1/chat/completions', async (req, res) => {
           },
         );
 
+        recordTurn(store, record.id, latestUserMessage, meetingResult);
+
         // 总结按 OpenAI 形状补发成 chunk，这样按 chat/completions 解析的客户端
         // （包括控制台）能用同一条 delta 逻辑把它读出来。
         for (const chunk of buildChatCompletionChunks({
@@ -736,6 +934,7 @@ app.post('/v1/chat/completions', async (req, res) => {
           model: String(req.body?.model ?? 'meeting'),
           content: meetingResult?.choices?.[0]?.message?.content ?? '',
           provider: 'meeting',
+          conversationId: record.id,
         })) {
           writeSse(res, chunk);
         }
@@ -745,10 +944,11 @@ app.post('/v1/chat/completions', async (req, res) => {
       }
 
       const meetingResponse = await runMeetingCompletion(
-        payload,
+        { ...payload, conversationId: record.id },
         meetingTemplate,
         completeWithProvider,
         {
+          priorTranscript,
           onProgress: async (event) => {
             if (event.type === 'meeting.started') {
               effectiveMeetingConversationId = event.meeting.conversationId;
@@ -756,6 +956,7 @@ app.post('/v1/chat/completions', async (req, res) => {
           },
         },
       );
+      recordTurn(store, record.id, latestUserMessage, meetingResponse);
       res.json(meetingResponse);
       return;
     }
