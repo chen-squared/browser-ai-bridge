@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 
 import { getProvider } from '../src/providers/registry.js';
 
+const PROVIDERS = ['chatgpt', 'claude', 'deepseek', 'grok', 'qwen', 'gemini'] as const;
+
 /**
  * 注册表里的 provider 配置。这些断言盯的都是**实测得来的页面结构**，
  * 页面一改版就可能失效——写下来是为了让改动必须经过一次有意识的确认，
@@ -61,24 +63,15 @@ describe('provider 配置', () => {
   });
 
   describe('真流捕获配置', () => {
-    it('五家已接真流，gemini 仍是 DOM 兜底', () => {
-      // gemini 的端点已定位、body 也能取到，但账号配额耗尽导致拿不到真实样本，
-      // 归约器无从验证，所以故意不接。见 registry.ts 里的注释。
-      for (const id of ['chatgpt', 'claude', 'deepseek', 'grok', 'qwen'] as const) {
+    it('六家全部已接真流', () => {
+      for (const id of ['chatgpt', 'claude', 'deepseek', 'grok', 'qwen', 'gemini'] as const) {
         assert.ok(getProvider(id).streamCapture, `${id} 应当已配真流捕获`);
       }
-      assert.equal(
-        getProvider('gemini').streamCapture,
-        undefined,
-        'gemini 尚未验证，不该挂一个没跑过的归约器',
-      );
     });
 
     it('每个 provider 用各自的归约器，不共用', () => {
-      // 共用归约器是这套设计最容易犯的错：协议不同，套用错就是静默抓错内容。
-      const used = ['chatgpt', 'claude', 'deepseek', 'grok', 'qwen'].map(
-        (id) => getProvider(id as 'chatgpt').streamCapture?.reducer,
-      );
+      // 共用归约器是这套设计最容易犯的错：协议不同，套错就是静默抓错内容。
+      const used = PROVIDERS.map((id) => getProvider(id).streamCapture?.reducer);
       assert.equal(new Set(used).size, used.length, `归约器不应重复：${used.join(', ')}`);
     });
 
@@ -90,6 +83,21 @@ describe('provider 配置', () => {
 
     it('grok 走 WebSocket，它是唯一能拿到真首字延迟的', () => {
       assert.equal(getProvider('grok').streamCapture?.transport, 'websocket');
+    });
+
+    it('gemini 的匹配模式不能要求 BardFrontendService 前面是斜杠', () => {
+      /**
+       * 这个断言守住一个已经犯过的错。真实路径是
+       * `…/assistant.lamda.BardFrontendService/StreamGenerate`——
+       * `BardFrontendService` 前面是**点号**不是斜杠。写成 `\/BardFrontendService…`
+       * 就永远匹配不上，而且症状很隐蔽：请求照常成功，只是静默退回 DOM 路径。
+       */
+      const pattern = getProvider('gemini').streamCapture?.endpointPattern ?? '';
+      const url =
+        'https://gemini.google.com/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate?rpcids=x';
+      assert.ok(new RegExp(pattern).test(url), `模式 ${pattern} 应匹配真实 URL`);
+      // 反证：加了前导斜杠就匹配不上了
+      assert.ok(!new RegExp(`\\/${pattern}`).test(url));
     });
   });
 

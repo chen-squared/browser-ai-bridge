@@ -499,7 +499,9 @@ curl -s http://127.0.0.1:3010/v1/chat/completions \
 | **grok** | **WebSocket** | OpenAI Responses 形状 | ✅ |
 | **chatgpt** | HTTP SSE | 补丁协议（`event: delta` 成对切帧） | ❌ |
 | **claude** | **HTTP JSON** | 会话快照（**不是 SSE**） | ❌ |
-| gemini | `batchexecute` RPC | DOM 兜底 | — |
+| **gemini** | **HTTP batchexecute** | 累积快照（取最长帧） | ❌ |
+
+六家全部接入。
 
 当前状态可用 `GET /providers/<provider>` 查看 `streamCapture` 字段确认。
 
@@ -522,10 +524,16 @@ WebSocket 帧则是实时事件，所以能边收边推。
   `é<U+009D>™`，正是 UTF-8 被按 CP1252 逐字节误解码的特征（CP1252 里 `0x99` 是 `™`）。
   而同一时刻的会话 JSON 端点文字完全正确——所以走 JSON，不走 SSE。
 
-**gemini 仍未接入**，原因写在 `src/providers/registry.ts` 的注释里：端点已定位
-（`…/BardFrontendService/StreamGenerate`），body 也能取到，但抓到的只有配额耗尽的
-错误码 `BardErrorInfo [1099]`，**没有真实答案样本**，归约器无法验证。它是 Google
-私有格式，没样本就只能靠猜内部结构写代码——那不如等配额重置。在那之前走 DOM。
+**gemini 走 Google 私有 batchexecute 封装**，回包是 `)]}'` 前缀加若干
+「`<数字>` + JSON 数组」并列。两个坑：
+
+- **那个数字不能用。** 实测第一帧声明 177 字节、实际 175，后续帧也都对不上，
+  没有任何统一偏移能让切出来的块成为合法 JSON。所以切帧靠**方括号配平**，
+  不靠长度。
+- **正文相关的帧是累积快照**（内层长度从 141 单调涨到 7217），但**不是所有帧都
+  增长**——最后还有 3 个内层只有 81/101/101 字符的另一种形状的收尾帧。所以取的是
+  **最长**那份，不是最后一帧。这与 DeepSeek/ChatGPT 的补丁协议正好相反：那两家要
+  应用补丁重建状态，Gemini 只要一份快照。
 
 ### 人机验证
 

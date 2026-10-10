@@ -34,8 +34,9 @@ const selectorOverrideSchema = z.object({
        *   grok     WebSocket，OpenAI Responses 形状，靠 text.channel 区分，纯 token 追加
        *   chatgpt  补丁协议（与 deepseek 同族但语义不同：空 p + add 是新增 message）
        *   claude   会话快照 JSON，**不是 SSE**；它的 SSE 中文编码损坏，故不用
+       *   gemini   Google 私有 batchexecute 封装；每帧是累积快照，取最后一帧即可
        */
-      reducer: z.enum(['qwen', 'deepseek', 'grok', 'chatgpt', 'claude']),
+      reducer: z.enum(['qwen', 'deepseek', 'grok', 'chatgpt', 'claude', 'gemini']),
     })
     .optional(),
   readyTimeoutMs: z.number().int().positive().optional(),
@@ -142,6 +143,18 @@ const defaultProviders: Record<ProviderId, ProviderConfig> = {
     //   2. 这是 Google 私有格式，随意变；没有真实样本就没法确认写对了。
     // 与其留一个没验证过的解析器，不如等配额重置、拿到样本再写。
     // 在那之前 Gemini 走 DOM 路径。
+    // 已接真流捕获（2026-10 实测，通配符用 BardFrontendService/StreamGenerate）：
+    // 注意**前面不要加 "/"**——真实路径是 `…/assistant.lamda.BardFrontendService/
+    // StreamGenerate`，`BardFrontendService` 前面是点号不是斜杠，加了斜杠就永远匹配不上。
+    // 回包是 Google 私有 batchexecute 封装 —— )]}' 前缀 + 「<数字>\n<JSON 数组>」并列。
+    // **那个数字不可信**（声明 177 实际 175，后续帧也都对不上），所以归约器
+    // 按方括号配平切帧。每帧都是**累积的完整状态**而非增量，取最后一帧即完整答案，
+    // 因此不需要拼接也不需要去重——这与 DeepSeek/ChatGPT 的补丁协议正好相反。
+    streamCapture: {
+      endpointPattern: 'BardFrontendService\\/StreamGenerate',
+      transport: 'http',
+      reducer: 'gemini',
+    },
     label: 'Gemini',
     url: 'https://gemini.google.com/app',
     urlPatterns: ['gemini.google.com'],

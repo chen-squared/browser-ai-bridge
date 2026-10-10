@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { describe, it, test } from 'node:test';
+import { readFileSync } from 'node:fs';
 
 import {
   createGrokAccumulator,
@@ -8,8 +9,10 @@ import {
   reduceChatgptStream,
   reduceClaudeConversation,
   reduceDeepseekStream,
+  reduceGeminiStream,
   reduceGrokStream,
   reduceQwenStream,
+  splitGeminiFrames,
 } from '../src/stream-capture.js';
 
 /**
@@ -623,5 +626,89 @@ describe('reduceClaudeConversation', () => {
       ],
     });
     assert.equal(reduceClaudeConversation(multi)?.content, '新答案');
+  });
+});
+
+describe('Gemini —— Google 私有 batchexecute 封装', () => {
+  /**
+   * 样本是 2026-10 真实抓取的 100KB 回包（题目「用一个字形容雪」）。
+   * 只保留覆盖各条代码路径的子集：最早的初始化帧、若干累积帧、结束帧。
+   *
+   * 回包形状：)]}' 前缀 + 「<数字>\n<JSON 数组>」并列。
+   */
+  const REAL = readFileSync(
+    new URL('./fixtures/gemini-stream-generate.txt', import.meta.url),
+    'utf8',
+  );
+
+  it('按方括号配平切帧，而不是相信那个长度前缀', () => {
+    // 那个数字是错的：第一帧声明 177 字节，实际 175。若按长度切会整段错位。
+    const frames = splitGeminiFrames(REAL);
+    assert.ok(frames.length >= 15, `应切出足够多的帧，实得 ${frames.length}`);
+    for (const frame of frames) {
+      assert.doesNotThrow(() => JSON.parse(frame), '每一帧都必须是合法 JSON');
+    }
+  });
+
+  it('还原出完整正文', () => {
+    const reduced = reduceGeminiStream(REAL);
+    assert.ok(reduced);
+    assert.match(reduced!.content, /最传神的是/);
+    assert.match(reduced!.content, /冷/);
+    assert.equal(reduced!.finished, true);
+  });
+
+  it('取会话 id', () => {
+    assert.match(reduceGeminiStream(REAL)!.conversationId!, /^c_[0-9a-z]+$/);
+  });
+
+  it('正文相关的帧是累积快照，所以取最长那份就是完整答案', () => {
+    /**
+     * 注意**不是所有帧都单调增长**。实测前 16 帧（内层 141 → 7217）是答案的
+     * 累积快照，之后还有 3 个内层只有 81/101/101 字符的**另一种形状的收尾帧**
+     * （标题、结束标记）。所以"取最后一帧"是错的，正确做法是取最长那份——
+     * 归约器就是这么做的。
+     */
+    const inners = splitGeminiFrames(REAL)
+      .map((f) => JSON.parse(f) as unknown[])
+      .filter((f) => Array.isArray(f[0]) && f[0][0] === 'wrb.fr')
+      .map((f) => (f[0] as unknown[])[2])
+      .filter((v): v is string => typeof v === 'string');
+    assert.ok(inners.length > 3);
+
+    const longest = Math.max(...inners.map((v) => v.length));
+    const growth = inners.map((v) => v.length);
+    assert.equal(longest, Math.max(...growth.slice(0, 16)), '最长的那份落在正文累积段内');
+    assert.ok(longest > growth.at(-1)!, '最长帧应当比那些小收尾帧长');
+
+    // 递增段内必须单调不减
+    for (let i = 1; i < 16; i += 1) {
+      assert.ok(growth[i] >= growth[i - 1], `递增段第 ${i} 帧应不短于上一帧`);
+    }
+  });
+
+  it('按形状找正文而不是写死下标——标题在别的位置，不能被误当成答案', () => {
+    // 真实包里标题「一字评雪的意蕴分析」和正文在同一层级的不同下标。
+    // 写死下标会把标题或思考当成答案。
+    const reduced = reduceGeminiStream(REAL);
+    assert.ok(!reduced!.content.includes('一字评雪的意蕴分析'), '标题不该混进正文');
+  });
+
+  it('非 batchexecute 输入返回 undefined，不抛错', () => {
+    assert.equal(reduceGeminiStream(''), undefined);
+    assert.equal(reduceGeminiStream('随便一段文字'), undefined);
+    assert.equal(reduceGeminiStream('data: {"a":1}'), undefined);
+  });
+
+  it('配额错误会抛出可读的错误，而不是静默返回空', () => {
+    // 实测配额耗尽时回的是 BardErrorInfo [1099]。这里手工造一个最小的等价帧，
+    // 长度前缀这里可以不给——切帧实际靠方括号配平。
+    const inner = JSON.stringify([
+      null,
+      ['c_1', 'r_1'],
+      { 1: ['type.googleapis.com/assistant.boq.bard.application.BardErrorInfo', [1099]] },
+    ]);
+    const frame = JSON.stringify([['wrb.fr', null, inner]]);
+    assert.throws(() => reduceGeminiStream(`)]}'\n\n${frame}`), /1099|配额/);
   });
 });

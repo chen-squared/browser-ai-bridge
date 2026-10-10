@@ -70,8 +70,9 @@ export type ProviderConfig = {
      *   grok     WebSocket，OpenAI Responses 形状，靠 text.channel 区分，纯 token 追加
      *   chatgpt  补丁协议（与 deepseek 同族，但空 p + add 表示新增 message）
      *   claude   会话快照 JSON，**不是 SSE**；它的 SSE 中文编码损坏，故不用
+     *   gemini   Google 私有 batchexecute 封装；每帧是累积快照，取最后一帧即可
      */
-    reducer: 'qwen' | 'deepseek' | 'grok' | 'chatgpt' | 'claude';
+    reducer: 'qwen' | 'deepseek' | 'grok' | 'chatgpt' | 'claude' | 'gemini';
   };
   /**
    * 用户消息的祖先标记。凡是同时命中这些选择器的元素，都不当作模型回复。

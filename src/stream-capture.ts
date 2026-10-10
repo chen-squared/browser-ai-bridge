@@ -925,3 +925,184 @@ export function reduceClaudeConversation(body: string): ReducedStream | undefine
     finished: true,
   };
 }
+
+/**
+ * Gemini 的 `batchexecute` 分帧。
+ *
+ * 回包形状（2026-10 实测 `…/BardFrontendService/StreamGenerate`）：
+ *   )]}'\n
+ *   <若干个「<数字>\n<JSON 数组>」并列而成>
+ *
+ * **那个数字不能用。** 实测第一帧声明 177 字节、实际 175，后续帧也都对不上，
+ * 没有任何统一偏移能让切出来的块成为合法 JSON。所以这里不按长度切，改成按
+ * **方括号配平**找每个顶层数组的边界——JSON 字符串内部的括号会跳过。
+ */
+export function splitGeminiFrames(body: string): string[] {
+  if (!body) {
+    return [];
+  }
+
+  // )]}' 是 Google 的 XSSI 前缀，去掉后按 [[ 起始位置扫描
+  const marker = body.indexOf(')]}');
+  const region = marker === -1 ? body : body.slice(marker + 4);
+
+  const frames: string[] = [];
+  let cursor = 0;
+  while (cursor < region.length) {
+    const start = region.indexOf('[[', cursor);
+    if (start === -1) {
+      break;
+    }
+
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+    let end = -1;
+    for (let i = start; i < region.length; i += 1) {
+      const ch = region[i];
+      if (inString) {
+        if (escaped) {
+          escaped = false;
+        } else if (ch === '\\') {
+          escaped = true;
+        } else if (ch === '"') {
+          inString = false;
+        }
+        continue;
+      }
+      if (ch === '"') {
+        inString = true;
+      } else if (ch === '[') {
+        depth += 1;
+      } else if (ch === ']') {
+        depth -= 1;
+        if (depth === 0) {
+          end = i + 1;
+          break;
+        }
+      }
+    }
+
+    if (end === -1) {
+      break;
+    }
+    frames.push(region.slice(start, end));
+    cursor = end;
+  }
+
+  return frames;
+}
+
+/** 在内层结构里按形状找答案，而不是写死下标。 */
+function findGeminiAnswer(inner: unknown): { text: string; conversationId?: string } {
+  const isStringArrayPair = (value: unknown): value is string[] =>
+    Array.isArray(value) && typeof value[0] === 'string' && typeof value[1] === 'string';
+
+  let answer = '';
+
+  const walk = (node: unknown, depth: number): void => {
+    if (depth > 8 || node === null || typeof node !== 'object') {
+      return;
+    }
+    if (Array.isArray(node)) {
+      // 模型输出块的形状：["rc_xxxxxxxx", [ ..., [ "...正文..." ], ... ], ...]
+      // 用 "rc_" 前缀定位，因为正文块的锚点是随机会话 id，而下标在
+      // 不同字段之间并不一致（正文在 [4]，标题却在 [2]）。
+      if (typeof node[0] === 'string' && node[0].startsWith('rc_')) {
+        const payload = node[1];
+        if (Array.isArray(payload) && typeof payload[0] === 'string') {
+          if (payload[0].length > answer.length) {
+            answer = payload[0];
+          }
+        }
+      }
+      for (const child of node) {
+        walk(child, depth + 1);
+      }
+    }
+  };
+
+  walk(inner, 0);
+
+  const pair = Array.isArray(inner) ? inner[1] : null;
+  const conversationId = isStringArrayPair(pair) ? pair[0] : undefined;
+
+  return { text: answer, ...(conversationId ? { conversationId } : {}) };
+}
+
+/**
+ * 归约 Gemini 的 `batchexecute` 回包。
+ *
+ * **每一帧都是累积的完整状态**，不是增量（实测内层长度从 141 单调涨到 7217，
+ * 正文越来越长）。所以取**最后一帧带正文的**就是完整答案——不需要拼接，
+ * 也不需要任何去重启发式。
+ *
+ * 这与 DeepSeek/ChatGPT 的补丁协议正好相反：那两家要应用补丁重建状态，
+ * Gemini 只要最后一份快照。
+ */
+export function reduceGeminiStream(body: string): ReducedStream | undefined {
+  let best: { text: string; conversationId?: string } | undefined;
+  let sawError: string | undefined;
+  let sawFrame = false;
+
+  for (const frame of splitGeminiFrames(body)) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(frame);
+    } catch {
+      continue;
+    }
+
+    const rows = Array.isArray(parsed) ? parsed : [parsed];
+    for (const row of rows) {
+      if (!Array.isArray(row)) {
+        continue;
+      }
+      // ["di", n] 是耗时统计；["e", n, ...] 是结束标记，都不是 wrb.fr
+      if (row[0] === 'e') {
+        continue;
+      }
+      const innerRaw = row[2];
+      if (typeof innerRaw !== 'string') {
+        continue;
+      }
+      sawFrame = true;
+
+      // 配额/风控等错误也走这里：BardErrorInfo 会被塞进同一层
+      if (innerRaw.includes('BardErrorInfo')) {
+        const code = /BardErrorInfo",\s*\[(\d+)\]/.exec(innerRaw);
+        sawError = `Gemini 返回错误码 ${code ? code[1] : '未知'}（配额、风控或网络）`;
+        continue;
+      }
+
+      let inner: unknown;
+      try {
+        inner = JSON.parse(innerRaw);
+      } catch {
+        continue;
+      }
+      const found = findGeminiAnswer(inner);
+      if (found.text && (!best || found.text.length > best.text.length)) {
+        best = found;
+      }
+    }
+  }
+
+  if (!sawFrame) {
+    return undefined;
+  }
+
+  if (!best?.text) {
+    if (sawError) {
+      throw new Error(sawError);
+    }
+    return undefined;
+  }
+
+  return {
+    content: best.text,
+    reasoningContent: '',
+    ...(best.conversationId ? { conversationId: best.conversationId } : {}),
+    finished: true,
+  };
+}

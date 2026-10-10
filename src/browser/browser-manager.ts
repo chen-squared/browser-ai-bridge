@@ -15,6 +15,7 @@ import {
   reduceChatgptStream,
   reduceClaudeConversation,
   reduceDeepseekStream,
+  reduceGeminiStream,
   reduceGrokStream,
   reduceQwenStream,
   type ReducedStream,
@@ -428,6 +429,18 @@ export class BrowserManager {
       for (const item of [...matched].reverse()) {
         const reduced = reduceClaudeConversation(item.text);
         if (reduced && (reduced.content || reduced.reasoningContent)) {
+          return reduced;
+        }
+      }
+      return undefined;
+    }
+
+    if (reducer === 'gemini') {
+      // 回包不是 SSE：)]}' 前缀 + 方括号配平的 JSON 数组，且每帧都是累积快照。
+      // 从后往前找——最后一帧就是完整答案。
+      for (const item of [...matched].reverse()) {
+        const reduced = reduceGeminiStream(item.text);
+        if (reduced?.content) {
           return reduced;
         }
       }
