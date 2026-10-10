@@ -683,14 +683,19 @@ describe('ChatGPT —— 首帧快照 + 后续 append 补丁（2026-10 实测）
     const firstAnswer = frames.findIndex((event) => {
       try {
         const frame = JSON.parse(event.data);
-        return frame?.v?.message?.author?.role === 'assistant' && Array.isArray(frame.v.message.content?.parts);
+        return (
+          frame?.v?.message?.author?.role === 'assistant' &&
+          Array.isArray(frame.v.message.content?.parts)
+        );
       } catch {
         return false;
       }
     });
     assert.ok(firstAnswer > 0, '真实流里应当有首帧的 assistant 快照');
 
-    const partial = reduceChatgptStream(frames.slice(0, firstAnswer + 1).map((event) => event.data));
+    const partial = reduceChatgptStream(
+      frames.slice(0, firstAnswer + 1).map((event) => event.data),
+    );
     assert.equal(partial?.content, '冬天的早晨，');
     assert.equal(partial?.finished, false, '还没收到结束帧，不能算 finished');
   });

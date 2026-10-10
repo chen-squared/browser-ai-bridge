@@ -724,8 +724,10 @@ export class ProviderClient {
         fullPrompt: prompt,
       },
     ).then(
-      (texts) => ({ ok: true, texts }) as { ok: true; texts: string[] } | { ok: false; error: unknown },
-      (error: unknown) => ({ ok: false, error }) as { ok: true; texts: string[] } | { ok: false; error: unknown },
+      (texts) =>
+        ({ ok: true, texts }) as { ok: true; texts: string[] } | { ok: false; error: unknown },
+      (error: unknown) =>
+        ({ ok: false, error }) as { ok: true; texts: string[] } | { ok: false; error: unknown },
     );
 
     const first = await Promise.race([

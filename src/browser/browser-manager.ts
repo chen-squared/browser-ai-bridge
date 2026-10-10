@@ -1,4 +1,10 @@
-import { chromium, type BrowserContext, type CDPSession, type Locator, type Page } from 'playwright';
+import {
+  chromium,
+  type BrowserContext,
+  type CDPSession,
+  type Locator,
+  type Page,
+} from 'playwright';
 import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { appConfig } from '../config.js';
@@ -371,7 +377,12 @@ export class BrowserManager {
     this.capturedStreams.set(page, recorded);
 
     if (provider.streamCapture.endpointGlob) {
-      void this.attachIncrementalStreamCapture(page, provider.streamCapture.endpointGlob, pattern, recorded);
+      void this.attachIncrementalStreamCapture(
+        page,
+        provider.streamCapture.endpointGlob,
+        pattern,
+        recorded,
+      );
     }
 
     page.on('response', (response) => {
@@ -431,7 +442,9 @@ export class BrowserManager {
     cdp.on('Fetch.requestPaused', (event) => {
       void (async () => {
         if (!pattern.test(event.request.url)) {
-          await cdp.send('Fetch.continueResponse', { requestId: event.requestId }).catch(() => undefined);
+          await cdp
+            .send('Fetch.continueResponse', { requestId: event.requestId })
+            .catch(() => undefined);
           return;
         }
 
@@ -442,10 +455,12 @@ export class BrowserManager {
             requestId: event.requestId,
           });
           // 放行与读流并行：页面要拿到数据，我们也要拿到正文。
-          void cdp.send('Fetch.continueResponse', { requestId: event.requestId }).catch(() => undefined);
+          void cdp
+            .send('Fetch.continueResponse', { requestId: event.requestId })
+            .catch(() => undefined);
 
-          // 先占位、边读边往里写，而不是读完再 push：上层只等 18 秒，
-          // 等读完再登记的话，这一轮已经超时退回 DOM 了。同一对象原地更新，
+          // 先占位、边读边往里写，而不是读完再 push：上层只等一个窗口，
+          // 等读完再登记的话，这一轮可能已经超时退回 DOM 了。同一对象原地更新，
           // 所以数组里不会堆积半成品条目。
           const entry: CapturedStream = { url: event.request.url, text: '', capturedAt: startedAt };
           recorded.push(entry);
@@ -464,7 +479,9 @@ export class BrowserManager {
           await cdp.send('IO.close', { handle: stream }).catch(() => undefined);
         } catch {
           // 取流失败也要放行，否则页面永远等不到这个响应。
-          await cdp.send('Fetch.continueResponse', { requestId: event.requestId }).catch(() => undefined);
+          await cdp
+            .send('Fetch.continueResponse', { requestId: event.requestId })
+            .catch(() => undefined);
         }
       })();
     });

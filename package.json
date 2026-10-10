@@ -13,6 +13,7 @@
     "lint:fix": "eslint src/ tests/ --fix",
     "format": "prettier --write src/ tests/",
     "format:check": "prettier --check src/ tests/",
+    "verify": "npm run format:check && npm run lint && npm test && npm run build",
     "kill:3010": "node scripts/kill-port.mjs 3010"
   },
   "dependencies": {

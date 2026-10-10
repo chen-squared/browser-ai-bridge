@@ -861,7 +861,9 @@
   </head>
   <body>
     <header class="topbar">
-      <div class="brand"><span class="brand-mark"></span><span class="brand-name">browser-ai-bridge</span></div>
+      <div class="brand">
+        <span class="brand-mark"></span><span class="brand-name">browser-ai-bridge</span>
+      </div>
       <nav class="tabs" role="tablist">
         <button class="tab" role="tab" data-view="playground" aria-selected="true">并排对比</button>
         <a class="tab" href="/meeting">会议</a>
@@ -878,8 +880,8 @@
       <div class="token-card">
         <h2>需要访问令牌</h2>
         <p>
-          这台 bridge 能操控已登录的网页账号，所以开了令牌校验。你可以在
-          Mac 上运行下面这条命令拿到令牌，粘到下面再进：
+          这台 bridge 能操控已登录的网页账号，所以开了令牌校验。你可以在 Mac
+          上运行下面这条命令拿到令牌，粘到下面再进：
         </p>
         <p><code class="mono">cat ~/…/opencode/bridge-token.txt</code></p>
         <input id="tokenInput" type="text" placeholder="粘贴 BRIDGE_TOKEN" />
@@ -1476,7 +1478,9 @@
         setStatus(
           $('playStatus'),
           failed.length || empty.length ? 'warn' : 'ok',
-          parts.length > 1 ? `${parts[0]}；${parts.slice(1).join('；')}。` : `全部完成，${parts[0]}。`,
+          parts.length > 1
+            ? `${parts[0]}；${parts.slice(1).join('；')}。`
+            : `全部完成，${parts[0]}。`,
         );
       }
 
