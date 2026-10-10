@@ -144,9 +144,18 @@ curl http://127.0.0.1:3010/v1/chat/completions \
 
 ## 控制台
 
-`http://127.0.0.1:3010` 提供四个标签页。
+两个独立入口，形态不同，所以不塞进一个页面：
 
-### 并排对比
+| 入口 | 用途 |
+|---|---|
+| `http://127.0.0.1:3010/` | **控制台** —— 多模型并排对比、会话管理、诊断 |
+| `http://127.0.0.1:3010/meeting` | **会议** —— 一条时间线上的多模型对话，有历史记录、可多轮 |
+
+会议页的布局照着各家 provider 的网页来：左侧历史栏（按日期分组）、中间窄列、
+底部输入卡片。设置（编排方式 / 席位 / 总结者）收在输入卡片上方的 chip 里，
+不占正文空间。
+
+### 控制台：并排对比
 
 勾选多个模型 → 并行提问 → 答案并排显示。每个模型各记各的 `conversationId`，
 所以下次接着聊不会串。同一模型内部会自己排队，不会互相踩。
@@ -159,7 +168,7 @@ curl http://127.0.0.1:3010/v1/chat/completions \
 这个标记来自 `GET /providers` 的 `streamCapture` 字段。五家已接真流，gemini 仍是
 DOM 兜底（原因见[真流捕获](#真流捕获哪些-provider-支持)）。
 
-### 多模型会议
+### 会议
 
 两种编排方式：
 
@@ -192,6 +201,18 @@ DOM 兜底（原因见[真流捕获](#真流捕获哪些-provider-支持)）。
 - **传某个席位名** → 复用该席位的会话，总结者能接着自己上一轮发言往下说
 
 指定一个不存在的席位名会退回新会话，不会静默复用错的。
+
+#### 记录与多轮
+
+会议记录存在 bridge 这一侧（默认 `.sessions/meetings.json`），**不存就没有第二次**——
+网页侧的会话只是当次编排用到的标签页，不是会议本身。
+
+- 每次发言都追加成"一轮"（用户那句话 + 随之而来的全部发言）
+- 继续提问时，之前各轮的全部发言会作为新成员的上下文，所以"接着聊"是真的接着聊
+- 首轮用户消息自动生成标题，点标题即可改名
+- 界面上可按日期查看历史、删除会议
+
+标题按**码点**截断（不是 UTF-16 单元），所以 emoji 不会被劈成乱码。
 
 ---
 
@@ -317,6 +338,21 @@ curl -X POST http://127.0.0.1:3010/meeting/plan \
   "summarizer": { "alias": "qwen-summary", "provider": "qwen" }
 }
 ```
+
+---
+
+### 会议记录
+
+| 端点 | 说明 |
+|---|---|
+| `GET /meetings` | 列出所有会议（摘要，不含完整发言记录） |
+| `POST /meetings` | 预建一场会议，拿到 id 后带着它发消息 |
+| `GET /meetings/:id` | 取完整记录（含每轮的全部发言） |
+| `PATCH /meetings/:id` | 改标题或编排配置（不影响已发生的轮次） |
+| `DELETE /meetings/:id` | 删除会议 |
+
+多轮不需要手动调这些：`POST /v1/chat/completions` 带上已有的 `conversationId`
+即可，服务端会自动取出历史发言作为上下文，并把本轮追加进去。
 
 ---
 
@@ -490,6 +526,24 @@ WebSocket 帧则是实时事件，所以能边收边推。
 （`…/BardFrontendService/StreamGenerate`），body 也能取到，但抓到的只有配额耗尽的
 错误码 `BardErrorInfo [1099]`，**没有真实答案样本**，归约器无法验证。它是 Google
 私有格式，没样本就只能靠猜内部结构写代码——那不如等配额重置。在那之前走 DOM。
+
+### 人机验证
+
+六家都可能弹 Cloudflare Turnstile、reCAPTCHA 之类的验证。这类拦截**只能由人点**，
+所以处理方式和普通失败不同：
+
+- **识别**：查确凿的验证组件（`.cf-turnstile`、`iframe[src*="recaptcha"]` 等）、
+  验证端点 URL，或「页面很空 + 出现验证话术」
+- **立刻把标签页切到前台** —— 这与 `REVEAL_ON_ERROR` 是两回事：普通失败不该
+  打扰（实测在 macOS 上会频繁抢前台），验证必须打扰，否则用户不知道有事要做
+- 同一页只弹一次，避免等待期间反复抢前台
+- 报错时说清"需要你手动点击"以及点完之后要做什么
+
+误报比漏报代价大得多：一篇讲验证码的技术文章也会出现"安全验证"字样，所以话术
+匹配额外要求页面几乎空白。组件和 URL 证据不受此限制。
+
+`GET /session/:provider/inspect` 会带上 `verification` 字段，排查"怎么发不出去"
+时可以直接看到。
 
 ### 标签页生命周期
 
@@ -709,16 +763,19 @@ src/
 ├── types.ts                # TypeScript 类型定义
 ├── prompt.ts               # 消息规范化逻辑
 ├── meeting.ts              # 多 provider 会议编排（席位、顺序、总结）
+├── meeting-store.ts        # 会议记录落盘（多轮与历史靠它）
 ├── stream-capture.ts       # 真流归约器（每家一套协议，不能互相套用）
 ├── session-sync.ts         # 复用还是续写：由历史前缀决定，不靠猜
 ├── conversation-identity.ts # 会话 id 抽取、同站点判定、标签页回收
 ├── http-access.ts          # Host 白名单（防 DNS rebinding）、可选 token
 ├── sse-chunks.ts           # 把答复切成 SSE chunk（按码点，不劈代理对）
 ├── console/
-│   └── index.html          # 控制台入口页（构建时拷进 dist）
+│   ├── index.html          # 控制台：并排对比 / 会话管理 / 诊断
+│   └── meeting.html        # 会议页：有历史记录的多轮对话
 ├── browser/
 │   ├── browser-manager.ts  # 浏览器生命周期管理（启动、页面复用）
 │   ├── provider-client.ts  # DOM 交互（定位输入框、发送、提取回复）
+│   ├── human-verification.ts  # 人机验证识别（六家通用，误报比漏报代价大）
 │   ├── response-text.ts    # 占位残渣过滤与长度门槛
 │   └── markdown-restoration.ts  # Markdown token 还原
 └── providers/

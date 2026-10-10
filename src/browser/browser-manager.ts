@@ -151,6 +151,20 @@ export class BrowserManager {
     }
   }
 
+  /**
+   * 取已有页签，**没有就返回 undefined**——绝不新建。
+   *
+   * 给诊断用：诊断接口不该有副作用，用 `getPage` 会在"我只是看看"的场景下
+   * 凭空开一个标签页。
+   */
+  peekPage(providerId: ProviderId, conversationId?: string): Page | undefined {
+    const entry = this.sessions.get(this.getSessionKey(providerId, conversationId));
+    if (!entry || entry.page.isClosed()) {
+      return undefined;
+    }
+    return entry.page;
+  }
+
   async getPage(providerId: ProviderId, conversationId?: string): Promise<Page> {
     const entry = await this.ensureSession(providerId, conversationId);
     return entry.page;
@@ -1351,6 +1365,17 @@ export class BrowserManager {
     }
 
     return items;
+  }
+
+  /**
+   * 把页签切到前台。
+   *
+   * 公开出来只为一处使用：**人机验证**。那种情况只能由人点，不弹出来用户就
+   * 不知道有事要做；而普通错误不该打扰（同 REVEAL_ON_ERROR，默认关闭），
+   * 因为那会频繁把窗口拽到前台，打断同一台机器上的其他工作。
+   */
+  async bringPageToFront(page: Page): Promise<void> {
+    await this.revealPage(page);
   }
 
   private async revealPage(page: Page): Promise<void> {

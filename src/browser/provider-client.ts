@@ -21,6 +21,11 @@ import {
   isPlaceholderArtifactText,
 } from './response-text.js';
 import { createGrokAccumulator, type ReducedStream, type LiveDelta } from '../stream-capture.js';
+import {
+  detectHumanVerificationOnPage,
+  verificationMessage,
+  type VerificationDetection,
+} from './human-verification.js';
 
 const STABLE_POLLS_REQUIRED = 3;
 const POLL_INTERVAL_MS = 1200;
@@ -559,10 +564,23 @@ export class ProviderClient {
       take: (page: Page, since: number) => ReducedStream | undefined;
       frames: (page: Page, since: number) => AsyncGenerator<string, void, void>;
     },
+    /**
+     * 把页签切到前台。
+     *
+     * 只用于**人机验证**——那种情况只能由人点，不弹出来用户就不知道有事要做。
+     * 普通错误不弹（见 REVEAL_ON_ERROR，默认关闭），因为那会频繁打断同一台
+     * 机器上的其他工作。
+     */
+    private readonly reveal?: (page: Page) => Promise<void>,
   ) {}
 
   private readonly toggleSettleTimeoutMs = 2200;
   private readonly sessionSelfCheckTimeoutMs = 5000;
+  /**
+   * 已经因人机验证弹过前台的页签。**同一页只弹一次**——等待生成期间会反复检查，
+   * 不去重的话用户点完验证、窗口又被抢回去。
+   */
+  private readonly verificationRevealedFor = new WeakSet<Page>();
   private extractionDebugItems: Array<{
     index: number;
     method: 'copy' | 'html' | 'innerText';
@@ -1262,6 +1280,14 @@ export class ProviderClient {
       throw new Error(`会话页已关闭，无法继续向 ${this.providerId} 发送消息`);
     }
 
+    // 人机验证要抢在所有别的判断之前：它会让输入框消失，于是走下面的
+    // "找不到输入框"分支，报出来是"页签不在可发送状态"——完全看不出真正原因，
+    // 用户也不知道该去点什么。
+    const verification = await this.detectHumanVerification(page);
+    if (verification) {
+      throw new Error(verificationMessage(this.providerId, verification));
+    }
+
     const currentUrl = page.url();
     const currentTitle = await page.title().catch(() => '');
     const hasExpectedUrl = this.matchesExpectedUrl(currentUrl, provider);
@@ -1287,6 +1313,12 @@ export class ProviderClient {
     const blockingState = await this.detectBlockingPageState(page, provider, recoveredInput);
     if (blockingState) {
       throw new Error(blockingState);
+    }
+
+    // 导航之后再看一次：验证页常常是跳转后才出现的
+    const afterNav = await this.detectHumanVerification(page);
+    if (afterNav) {
+      throw new Error(verificationMessage(this.providerId, afterNav));
     }
 
     const recoveredTitle = await page.title().catch(() => '');
@@ -2172,6 +2204,13 @@ export class ProviderClient {
       return `${this.providerId} 当前页面出现网络错误，请查看页签状态并稍后重试`;
     }
 
+    // 人机验证优先于登录判断：验证页同样没有输入框，而且文案里常带"登录"字样，
+    // 不先判就会报成"需要重新登录"，把用户引到错误的操作上。
+    const verification = await this.detectHumanVerification(page);
+    if (verification) {
+      return verificationMessage(this.providerId, verification);
+    }
+
     const authHints = [
       'log in',
       'login',
@@ -2195,6 +2234,23 @@ export class ProviderClient {
     }
 
     return undefined;
+  }
+
+  /**
+   * 采集页面快照并判定是否停在人机验证上。
+   *
+   * 只用一次性 `page.evaluate` 读取，不注入任何常驻脚本——和之前拒绝的
+   * `addInitScript` 劫持 fetch 不同，这里不修改页面环境，站点无从检测。
+   *
+   * 命中即**把标签页切到前台**：这类验证只能由人点，不弹出来用户根本不知道
+   * 有事要做。这与 REVEAL_ON_ERROR 是两回事——普通失败不该打扰，验证必须打扰。
+   */
+  private async detectHumanVerification(page: Page): Promise<VerificationDetection | null> {
+    // 判定与"弹前台"都在共享实现里，诊断端点用的是同一套，不会两处漂移。
+    return detectHumanVerificationOnPage(page, {
+      reveal: this.reveal,
+      alreadyRevealed: this.verificationRevealedFor,
+    });
   }
 
   private async detectFastFailState(page: Page): Promise<string | undefined> {
