@@ -31,6 +31,21 @@ const STABLE_POLLS_REQUIRED = 3;
 const POLL_INTERVAL_MS = 1200;
 const DEFAULT_TIMEOUT_MS = 90000;
 
+/**
+ * 等真流的最长时间。这个窗口现在**与 DOM 稳定等待同时跑**（原来是串行的），
+ * 所以它必须覆盖整段生成时间：实测 qwen 的流要 20 秒才吐完，18 秒会差一点，
+ * 差一点的后果是明明抓到了权威答案却退回 DOM。
+ */
+const STREAM_CAPTURE_WINDOW_MS = 30_000;
+
+/**
+ * DOM 已经给出结果后，还愿意为真流多等多久。
+ *
+ * 真流仍然更权威，但流没来的 provider 不该为此白等满整个窗口——
+ * 站点偶发抽风时，这 3 秒就是"慢一点"和"卡半分钟"的差别。
+ */
+const STREAM_GRACE_AFTER_DOM_MS = 3_000;
+
 const turndownService = new TurndownService({
   bulletListMarker: '-',
   codeBlockStyle: 'fenced',
@@ -663,6 +678,10 @@ export class ProviderClient {
     // 才把整条流吐完），不等就取不到，就静默退回 DOM——而 ChatGPT 新版 DOM 里
     // `article` / `data-message-author-role` 全没了，只会抓出侧栏的「没有项目」。
     const streamResult = async (): Promise<ChatResult | undefined> => {
+      // 没配流捕获的 provider 不该在这里空转整个窗口。
+      if (!provider.streamCapture) {
+        return undefined;
+      }
       const captured = await this.awaitCapturedStream(page, streamSentAt);
       if (!captured?.content || isPlaceholderArtifactText(captured.content)) {
         return undefined;
@@ -735,8 +754,12 @@ export class ProviderClient {
       throw first.outcome.error;
     } else {
       responseTexts = first.outcome.texts;
-      // DOM 先好了，但真流仍是权威：拿到了就用它。
-      const fromStream = await streamTask;
+      // DOM 先好了，但真流仍是权威：给它一小段宽限期，到点就用手上的 DOM 结果。
+      // 不设上限地等流，会在流彻底没来的时候白等满整个窗口。
+      const fromStream = await Promise.race([
+        streamTask,
+        page.waitForTimeout(STREAM_GRACE_AFTER_DOM_MS).then(() => undefined),
+      ]);
       if (fromStream) {
         return fromStream;
       }
@@ -1049,7 +1072,7 @@ export class ProviderClient {
   private async awaitCapturedStream(
     page: Page,
     since: number,
-    timeoutMs = 18_000,
+    timeoutMs = STREAM_CAPTURE_WINDOW_MS,
   ): Promise<ReturnType<NonNullable<typeof this.streamSource>['take']>> {
     const startedAt = Date.now();
     let last: ReturnType<NonNullable<typeof this.streamSource>['take']>;

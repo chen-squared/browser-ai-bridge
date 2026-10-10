@@ -363,6 +363,11 @@ const defaultProviders: Record<ProviderId, ProviderConfig> = {
     // 属于完全失效的选择器，已删除。）
     excludeUserMessageSelectors: ['[data-testid="user-message"]', '.bg-surface-user-bubble'],
     busySelectors: ['button[aria-label*="Stop"]'],
+    // 偶发：点击发送按钮后 8 秒内等不到任何确认信号，bridge 就报"未确认提交成功"
+    // 并放弃（宁可失败也不重复发送）。实测同一套信号在 0.6 秒就能确认，
+    // 说明是站点偶尔反应慢，不是选择器错了。
+    // 这里只放宽**失败路径**的等待时间：信号一来立刻返回，正常路径一点不变慢。
+    submissionSignalTimeoutMs: 15000,
     toggles: {
       search: {
         buttonSelectors: [
