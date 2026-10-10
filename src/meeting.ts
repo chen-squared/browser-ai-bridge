@@ -330,12 +330,24 @@ export async function runMeetingCompletion(
   }>,
   options?: {
     onProgress?: (event: MeetingProgressEvent) => Promise<void> | void;
+    /**
+     * 之前几轮的全部发言。**多轮的关键**：新一轮的每个成员都要带着旧发言开场，
+     * 否则"接着聊"就退化成"每次都是新会议"。
+     */
+    priorTranscript?: MeetingTranscriptEntry[];
   },
 ) {
   const plan = resolveMeetingPlan(template, payload);
   const policy = buildMeetingPolicy(plan);
   const seedMessages = payload.messages.map((message) => ({ ...message }));
-  const transcript = toMeetingTranscriptSeed(seedMessages);
+  // 旧发言在前、本轮用户消息在后。新开一场时 priorTranscript 为空，行为不变。
+  const transcript: MeetingTranscriptEntry[] = [
+    ...(options?.priorTranscript ?? []).map((entry) => ({ ...entry })),
+    ...toMeetingTranscriptSeed(seedMessages),
+  ];
+  // 本轮新增的发言从这里开始算起——存储时要单独存成"一轮"，
+  // 而不是把整场会议反复叠加进历史。
+  const turnStartIndex = transcript.length;
   const effectiveConversationId = payload.conversationId ?? `meeting-${randomUUID()}`;
   const roster = buildMeetingRoster(plan);
   const _discussionParticipants = plan.participants.filter((participant) =>
@@ -481,6 +493,9 @@ export async function runMeetingCompletion(
         summarizer: plan.summarizer,
         policy,
         transcript,
+        // dryRun 不真的发消息，所以本轮没有任何新增发言。字段仍要给全，
+        // 否则调用方要按"字段可能不存在"来处理，徒增分支。
+        turnEntries: [],
       },
       choices: [
         {
@@ -608,6 +623,8 @@ export async function runMeetingCompletion(
       summarizer: plan.summarizer,
       policy,
       transcript,
+      /** 只有本轮新增的发言。存储层用它来划出"一轮"。 */
+      turnEntries: transcript.slice(turnStartIndex),
     },
     page: {
       urls: pageUrls,

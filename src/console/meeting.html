@@ -1,0 +1,1429 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>会议 · browser-ai-bridge</title>
+    <style>
+      /* 布局语言照着各 provider 的网页来（左侧历史栏 + 中间窄列 + 底部输入卡片），
+         只是换成深色，和控制台保持一致。 */
+      :root {
+        color-scheme: dark;
+        --bg: #0d1117;
+        --sidebar: #0a0e14;
+        --panel: #161d27;
+        --panel-hi: #1c2531;
+        --ink: #e6edf3;
+        --ink-dim: #9aa7b4;
+        --ink-faint: #6b7887;
+        --line: #232c39;
+        --line-hi: #35414f;
+        --accent: #4a9eff;
+        --accent-dim: #1f6feb;
+        --ok: #3fb950;
+        --warn: #d29922;
+        --danger: #f85149;
+        --sidebar-w: 260px;
+        --column-w: 780px;
+        --mono: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+        --sans:
+          -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei',
+          sans-serif;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      html,
+      body {
+        height: 100%;
+        margin: 0;
+      }
+
+      body {
+        font-family: var(--sans);
+        font-size: 15px;
+        line-height: 1.7;
+        background: var(--bg);
+        color: var(--ink);
+        -webkit-font-smoothing: antialiased;
+      }
+
+      button {
+        padding: 7px 13px;
+        border: 1px solid var(--line-hi);
+        border-radius: 8px;
+        background: var(--panel-hi);
+        color: var(--ink);
+        font: inherit;
+        font-size: 13px;
+        cursor: pointer;
+      }
+
+      button:hover:not(:disabled) {
+        border-color: #4a5b73;
+        background: #232e3c;
+      }
+
+      button:disabled {
+        opacity: 0.45;
+        cursor: not-allowed;
+      }
+
+      button.primary {
+        border-color: var(--accent-dim);
+        background: var(--accent-dim);
+        color: #fff;
+      }
+
+      button.primary:hover:not(:disabled) {
+        background: #2b7cf0;
+      }
+
+      button.ghost {
+        border-color: transparent;
+        background: none;
+        color: var(--ink-dim);
+      }
+
+      button.ghost:hover:not(:disabled) {
+        background: var(--panel-hi);
+        color: var(--ink);
+      }
+
+      input,
+      textarea,
+      select {
+        padding: 8px 10px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: var(--bg);
+        color: var(--ink);
+        font: inherit;
+        font-size: 14px;
+      }
+
+      input:focus,
+      textarea:focus,
+      select:focus {
+        border-color: var(--accent-dim);
+        outline: none;
+      }
+
+      /* ── 骨架 ───────────────────────────────────────────────── */
+      .app {
+        display: grid;
+        grid-template-columns: var(--sidebar-w) 1fr;
+        height: 100vh;
+      }
+
+      /* ── 侧栏 ───────────────────────────────────────────────── */
+      .sidebar {
+        display: flex;
+        flex-direction: column;
+        border-right: 1px solid var(--line);
+        background: var(--sidebar);
+        overflow: hidden;
+      }
+
+      .sidebar-head {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 12px 12px 8px;
+      }
+
+      .brand {
+        flex: 1;
+        font-size: 13px;
+        font-weight: 600;
+        white-space: nowrap;
+      }
+
+      .brand a {
+        color: var(--ink);
+        text-decoration: none;
+      }
+
+      .new-meeting {
+        margin: 0 12px 10px;
+        padding: 10px;
+        border-radius: 10px;
+        font-size: 13.5px;
+      }
+
+      .history {
+        flex: 1;
+        overflow-y: auto;
+        padding: 0 8px 12px;
+      }
+
+      .history-group {
+        margin-top: 12px;
+        padding: 0 6px 4px;
+        color: var(--ink-faint);
+        font-size: 11.5px;
+      }
+
+      .history-item {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        padding: 7px 8px;
+        border: none;
+        border-radius: 8px;
+        background: none;
+        color: var(--ink-dim);
+        font-size: 13px;
+        text-align: left;
+        width: 100%;
+        cursor: pointer;
+      }
+
+      .history-item:hover {
+        background: var(--panel-hi);
+        color: var(--ink);
+      }
+
+      .history-item[aria-current='true'] {
+        background: var(--panel-hi);
+        color: var(--ink);
+      }
+
+      .history-title {
+        flex: 1;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .history-meta {
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 10px;
+      }
+
+      .history-del {
+        padding: 0 4px;
+        border: none;
+        background: none;
+        color: var(--ink-faint);
+        font-size: 14px;
+        line-height: 1;
+        opacity: 0;
+      }
+
+      .history-item:hover .history-del {
+        opacity: 1;
+      }
+
+      .history-del:hover {
+        color: var(--danger);
+        background: none;
+      }
+
+      .sidebar-empty {
+        padding: 20px 12px;
+        color: var(--ink-faint);
+        font-size: 12.5px;
+        text-align: center;
+      }
+
+      /* ── 主区 ───────────────────────────────────────────────── */
+      .main {
+        display: flex;
+        flex-direction: column;
+        min-width: 0;
+      }
+
+      .topbar {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        height: 52px;
+        padding: 0 18px;
+        border-bottom: 1px solid var(--line);
+      }
+
+      .topbar h1 {
+        flex: 1;
+        margin: 0;
+        overflow: hidden;
+        font-size: 14px;
+        font-weight: 600;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .title-input {
+        flex: 1;
+        padding: 5px 8px;
+        font-size: 14px;
+        font-weight: 600;
+      }
+
+      .scroll {
+        flex: 1;
+        overflow-y: auto;
+      }
+
+      .column {
+        max-width: var(--column-w);
+        margin: 0 auto;
+        padding: 26px 20px 8px;
+      }
+
+      /* ── 空态 ───────────────────────────────────────────────────
+     垂直居中：各家 provider 的首屏都是这样，视线不用先往上找。 */
+      .welcome {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        min-height: calc(100vh - 260px);
+        max-width: var(--column-w);
+        margin: 0 auto;
+        padding: 20px;
+        text-align: center;
+      }
+
+      /* `hidden` 属性自带的 display:none 会被上面这条 display:flex 盖掉，
+         所以必须显式再写一次——否则打开会议后空态仍然占着半个屏。 */
+      .welcome[hidden] {
+        display: none;
+      }
+
+      .welcome h2 {
+        margin: 0 0 6px;
+        font-size: 24px;
+        font-weight: 600;
+      }
+
+      .welcome p {
+        margin: 0 0 24px;
+        color: var(--ink-dim);
+        font-size: 14px;
+      }
+
+      /* ── 消息 ───────────────────────────────────────────────── */
+      .turn {
+        margin-bottom: 26px;
+      }
+
+      .msg {
+        display: flex;
+        gap: 11px;
+        margin-bottom: 18px;
+      }
+
+      .msg.user {
+        justify-content: flex-end;
+      }
+
+      /* 用户消息是右对齐的气泡。要限宽的是 .msg-main（真正的承载元素），
+         限错元素的话 justify-content 就没东西可推，气泡会顶满整行。 */
+      .msg.user .msg-main {
+        max-width: 78%;
+        flex: none;
+      }
+
+      .msg.user .msg-body {
+        padding: 10px 15px;
+        border: 1px solid var(--line-hi);
+        border-radius: 16px;
+        background: var(--panel-hi);
+      }
+
+      .avatar {
+        display: flex;
+        flex: none;
+        align-items: center;
+        justify-content: center;
+        width: 26px;
+        height: 26px;
+        margin-top: 2px;
+        border-radius: 7px;
+        background: var(--panel-hi);
+        color: var(--ink-dim);
+        font-family: var(--mono);
+        font-size: 10.5px;
+        font-weight: 600;
+      }
+
+      .avatar.summary {
+        background: var(--accent-dim);
+        color: #fff;
+      }
+
+      .msg-main {
+        min-width: 0;
+        flex: 1;
+      }
+
+      .msg-who {
+        display: flex;
+        align-items: baseline;
+        gap: 8px;
+        margin-bottom: 3px;
+        font-size: 12.5px;
+      }
+
+      .msg-name {
+        font-weight: 600;
+      }
+
+      .msg-stage {
+        padding: 1px 6px;
+        border-radius: 4px;
+        background: var(--panel-hi);
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 10px;
+      }
+
+      .msg-body {
+        font-size: 14.5px;
+        word-break: break-word;
+      }
+
+      .msg-body > :first-child {
+        margin-top: 0;
+      }
+
+      .msg-body > :last-child {
+        margin-bottom: 0;
+      }
+
+      .msg-body p {
+        margin: 0 0 10px;
+      }
+
+      .msg-body ul,
+      .msg-body ol {
+        margin: 0 0 10px;
+        padding-left: 22px;
+      }
+
+      .msg-body pre {
+        padding: 11px;
+        border-radius: 8px;
+        background: var(--bg);
+        overflow-x: auto;
+        font-family: var(--mono);
+        font-size: 12.5px;
+      }
+
+      .msg-body code {
+        padding: 1px 5px;
+        border-radius: 4px;
+        background: var(--panel-hi);
+        font-family: var(--mono);
+        font-size: 12.5px;
+      }
+
+      .msg-body pre code {
+        padding: 0;
+        background: none;
+      }
+
+      .msg-body table {
+        border-collapse: collapse;
+        margin-bottom: 10px;
+      }
+
+      .msg-body th,
+      .msg-body td {
+        padding: 5px 10px;
+        border: 1px solid var(--line);
+      }
+
+      .msg-body blockquote {
+        margin: 0 0 10px;
+        padding-left: 12px;
+        border-left: 2px solid var(--line-hi);
+        color: var(--ink-dim);
+      }
+
+      .summary-card {
+        padding: 14px 16px;
+        border: 1px solid var(--accent-dim);
+        border-radius: 14px;
+        background: rgba(31, 111, 235, 0.07);
+      }
+
+      .thinking summary {
+        margin-bottom: 6px;
+        color: var(--ink-faint);
+        font-size: 12px;
+        cursor: pointer;
+      }
+
+      /* ── 输入区 ─────────────────────────────────────────────── */
+      .composer-wrap {
+        padding: 10px 20px 18px;
+      }
+
+      .composer {
+        max-width: var(--column-w);
+        margin: 0 auto;
+        padding: 12px 12px 10px;
+        border: 1px solid var(--line-hi);
+        border-radius: 16px;
+        background: var(--panel);
+        transition: border-color 0.15s;
+      }
+
+      .composer:focus-within {
+        border-color: #46536a;
+      }
+
+      .composer textarea {
+        width: 100%;
+        min-height: 54px;
+        max-height: 220px;
+        padding: 2px 4px;
+        border: none;
+        background: none;
+        font-size: 15px;
+        line-height: 1.65;
+        resize: none;
+      }
+
+      .composer textarea:focus {
+        outline: none;
+      }
+
+      .composer-row {
+        display: flex;
+        align-items: center;
+        gap: 7px;
+        flex-wrap: wrap;
+      }
+
+      /* 功能 chip：顺序、席位、总结者都收在这里，点开是设置面板 */
+      .chip {
+        display: inline-flex;
+        align-items: center;
+        gap: 5px;
+        padding: 5px 10px;
+        border: 1px solid var(--line-hi);
+        border-radius: 999px;
+        background: var(--panel-hi);
+        color: var(--ink-dim);
+        font-size: 12.5px;
+        cursor: pointer;
+      }
+
+      .chip:hover {
+        color: var(--ink);
+      }
+
+      .chip[data-on='true'] {
+        border-color: var(--accent-dim);
+        color: var(--ink);
+      }
+
+      .chip-dot {
+        width: 6px;
+        height: 6px;
+        border-radius: 50%;
+        background: var(--ink-faint);
+      }
+
+      .chip[data-on='true'] .chip-dot {
+        background: var(--accent);
+      }
+
+      .spacer {
+        flex: 1;
+      }
+
+      .send {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        width: 32px;
+        height: 32px;
+        padding: 0;
+        border-radius: 50%;
+        background: var(--accent-dim);
+        color: #fff;
+        font-size: 15px;
+      }
+
+      .send:disabled {
+        background: var(--panel-hi);
+        color: var(--ink-faint);
+      }
+
+      /* ── 设置面板 ───────────────────────────────────────────── */
+      .settings {
+        display: none;
+        max-width: var(--column-w);
+        margin: 0 auto 8px;
+        padding: 14px;
+        border: 1px solid var(--line);
+        border-radius: 14px;
+        background: var(--panel);
+      }
+
+      .settings[data-open='true'] {
+        display: block;
+      }
+
+      .settings-title {
+        margin-bottom: 8px;
+        color: var(--ink-dim);
+        font-size: 12px;
+      }
+
+      .mode-row {
+        display: flex;
+        gap: 7px;
+        margin-bottom: 12px;
+      }
+
+      .mode-row .chip {
+        padding: 6px 12px;
+      }
+
+      .seat-list {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+        margin-bottom: 12px;
+      }
+
+      .seat {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 6px 8px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: var(--bg);
+      }
+
+      .seat select {
+        flex: 1;
+        padding: 5px 8px;
+        font-size: 13px;
+      }
+
+      .seat-name {
+        min-width: 76px;
+        color: var(--ink-dim);
+        font-family: var(--mono);
+        font-size: 11px;
+      }
+
+      .seat button {
+        padding: 3px 7px;
+        font-size: 12px;
+      }
+
+      .settings-grid {
+        display: grid;
+        gap: 10px;
+        grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+        margin-bottom: 10px;
+      }
+
+      .settings-grid label {
+        display: block;
+        color: var(--ink-dim);
+        font-size: 12px;
+      }
+
+      .settings-grid select,
+      .settings-grid input {
+        width: 100%;
+        margin-top: 3px;
+        font-size: 13px;
+      }
+
+      .hint {
+        margin: 0;
+        color: var(--ink-faint);
+        font-size: 11.5px;
+      }
+
+      /* ── 状态 ───────────────────────────────────────────────── */
+      .status {
+        max-width: var(--column-w);
+        margin: 0 auto 8px;
+        padding: 8px 12px;
+        border: 1px solid var(--line);
+        border-left: 2px solid var(--ink-faint);
+        border-radius: 8px;
+        background: var(--panel);
+        color: var(--ink-dim);
+        font-size: 12.5px;
+      }
+
+      .status[data-tone='err'] {
+        border-left-color: var(--danger);
+        color: #ffb4ae;
+      }
+
+      .status[data-tone='busy'] {
+        border-left-color: var(--accent);
+      }
+
+      .status[data-tone='busy']::before {
+        content: '';
+        display: inline-block;
+        width: 7px;
+        height: 7px;
+        margin-right: 7px;
+        border-radius: 50%;
+        background: var(--accent);
+        animation: pulse 1s ease-in-out infinite;
+      }
+
+      @keyframes pulse {
+        0%,
+        100% {
+          opacity: 0.25;
+        }
+        50% {
+          opacity: 1;
+        }
+      }
+
+      .pending .msg-body::after {
+        content: '▌';
+        color: var(--accent);
+        animation: blink 1s steps(2) infinite;
+      }
+
+      @keyframes blink {
+        50% {
+          opacity: 0;
+        }
+      }
+
+      @media (max-width: 760px) {
+        .app {
+          grid-template-columns: 1fr;
+        }
+
+        .sidebar {
+          display: none;
+        }
+
+        .sidebar[data-open='true'] {
+          display: flex;
+          position: fixed;
+          inset: 0;
+          z-index: 30;
+        }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        .status[data-tone='busy']::before,
+        .pending .msg-body::after {
+          animation: none;
+        }
+      }
+    </style>
+    <script src="/vendor/marked/marked.umd.js"></script>
+  </head>
+  <body>
+    <div class="app">
+      <aside class="sidebar" id="sidebar">
+        <div class="sidebar-head">
+          <div class="brand"><a href="/">← 控制台</a></div>
+          <button class="ghost" id="refreshListBtn" title="刷新列表">↻</button>
+        </div>
+        <button class="new-meeting" id="newMeetingBtn">＋ 发起新会议</button>
+        <div class="history" id="history"></div>
+      </aside>
+
+      <main class="main">
+        <div class="topbar">
+          <button class="ghost" id="toggleSidebarBtn" title="历史列表">☰</button>
+          <h1 id="meetingTitle">新会议</h1>
+          <span
+            class="faint"
+            id="meetingMeta"
+            style="color: var(--ink-faint); font-size: 12px"
+          ></span>
+        </div>
+
+        <div class="scroll" id="scroll">
+          <div class="welcome" id="welcome">
+            <h2>发起一场会议</h2>
+            <p>多个模型围绕你的问题依次或同时作答，最后由一位总结者收口。</p>
+          </div>
+          <div class="column" id="transcript"></div>
+        </div>
+
+        <div class="composer-wrap">
+          <div class="status" id="status">选好席位，写下第一个问题。</div>
+
+          <div class="settings" id="settings">
+            <div class="settings-title">编排方式</div>
+            <div class="mode-row">
+              <span class="chip" data-mode="round-robin" data-on="true">
+                <span class="chip-dot"></span>顺序对话
+              </span>
+              <span class="chip" data-mode="parallel" data-on="false">
+                <span class="chip-dot"></span>并行作答
+              </span>
+            </div>
+
+            <div class="settings-title">参与者（顺序即发言顺序）</div>
+            <div class="seat-list" id="seatList"></div>
+            <div style="margin-bottom: 12px">
+              <button class="ghost" id="addSeatBtn">添加参与者</button>
+            </div>
+
+            <div class="settings-grid">
+              <label>
+                总结者
+                <select id="summarizer"></select>
+              </label>
+              <label>
+                总结用哪个会话
+                <select id="summarizerSeat"></select>
+              </label>
+              <label>
+                发言轮数
+                <input type="number" id="rounds" min="1" max="4" value="1" />
+              </label>
+            </div>
+            <p class="hint" id="seatHint"></p>
+          </div>
+
+          <div class="composer">
+            <textarea id="input" placeholder="给会议出题，例如：比较这三种实现的取舍。"></textarea>
+            <div class="composer-row">
+              <span class="chip" id="modeChip"><span class="chip-dot"></span>顺序对话</span>
+              <span class="chip" id="seatsChip"
+                ><span class="chip-dot"></span><span id="seatsChipText">3 个席位</span></span
+              >
+              <span class="chip" id="settingsChip"
+                ><span class="chip-dot"></span><span id="settingsChipText">设置</span></span
+              >
+              <div class="spacer"></div>
+              <button class="send" id="sendBtn" title="发送（⌘/Ctrl + Enter）" disabled>↑</button>
+            </div>
+          </div>
+        </div>
+      </main>
+    </div>
+
+    <script>
+      const $ = (id) => document.getElementById(id);
+
+      const PROVIDERS = ['chatgpt', 'claude', 'deepseek', 'grok', 'qwen', 'gemini'];
+      const LABELS = {
+        chatgpt: 'ChatGPT',
+        claude: 'Claude',
+        deepseek: 'DeepSeek',
+        grok: 'Grok',
+        qwen: '通义千问',
+        gemini: 'Gemini',
+      };
+      const MODE_LABEL = { 'round-robin': '顺序对话', parallel: '并行作答' };
+      const STAGE_LABEL = { assignment: '分工', discussion: '发言', summary: '总结' };
+
+      const state = {
+        /** 当前打开的会议 id；null = 还没发过（还没落库） */
+        meetingId: null,
+        mode: 'round-robin',
+        seats: ['chatgpt', 'claude', 'deepseek'].map((provider) => ({ provider })),
+        summarizer: 'qwen',
+        summarizerSeat: '',
+        rounds: 1,
+        seatAliases: [],
+        busy: false,
+      };
+
+      function escapeHtml(value) {
+        return String(value).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      }
+
+      function render(value) {
+        if (window.marked) {
+          return window.marked.parse(value);
+        }
+        return escapeHtml(value).replace(/\n/g, '<br>');
+      }
+
+      function token() {
+        try {
+          return sessionStorage.getItem('bridge.token') || '';
+        } catch {
+          return '';
+        }
+      }
+
+      async function api(url, options) {
+        const headers = { 'Content-Type': 'application/json', ...(options?.headers || {}) };
+        const tk = token();
+        if (tk) {
+          headers['x-bridge-token'] = tk;
+        }
+        const response = await fetch(url, { ...(options || {}), headers });
+        const text = await response.text();
+        let payload = text;
+        try {
+          payload = JSON.parse(text);
+        } catch {
+          /* 不是 JSON 就按原文 */
+        }
+        if (!response.ok) {
+          throw new Error(payload?.error?.message || text || `HTTP ${response.status}`);
+        }
+        return payload;
+      }
+
+      function setStatus(tone, message) {
+        const node = $('status');
+        node.dataset.tone = tone;
+        node.textContent = message;
+      }
+
+      /* ── 席位名由服务端算 ──────────────────────────────────────
+         席位名同时是会话身份（进 conversationId），前端自己算一遍
+         就可能和��务端漂移，静默复用错会话。只认 /meeting/plan。 */
+      async function refreshSeatNames() {
+        try {
+          const plan = await api('/meeting/plan', {
+            method: 'POST',
+            body: JSON.stringify({
+              template:
+                state.mode === 'parallel' ? 'meeting-parallel-web' : 'meeting-round-robin-web',
+              participants: state.seats.map((seat) => seat.provider),
+              summarizer: state.summarizer,
+              ...(state.summarizerSeat ? { summarizerSeat: state.summarizerSeat } : {}),
+            }),
+          });
+          state.seatAliases = plan.participants.map((p) => p.alias);
+        } catch {
+          const counters = new Map();
+          state.seatAliases = state.seats.map((seat) => {
+            const n = (counters.get(seat.provider) ?? 0) + 1;
+            counters.set(seat.provider, n);
+            return `${seat.provider}${n}`;
+          });
+        }
+        if (!state.seatAliases.includes(state.summarizerSeat)) {
+          state.summarizerSeat = '';
+        }
+        renderSettings();
+      }
+
+      /* ── 侧栏历史 ─────────────────────────────────────────── */
+      function dayKey(ts) {
+        const d = new Date(ts);
+        const today = new Date();
+        const sameDay = (a, b) =>
+          a.getFullYear() === b.getFullYear() &&
+          a.getMonth() === b.getMonth() &&
+          a.getDate() === b.getDate();
+        if (sameDay(d, today)) return '今天';
+        const yesterday = new Date(today.getTime() - 86400000);
+        if (sameDay(d, yesterday)) return '昨天';
+        const week = new Date(today.getTime() - 7 * 86400000);
+        if (d >= week) return '最近 7 天';
+        return d.getFullYear() + ' 年 ' + (d.getMonth() + 1) + ' 月';
+      }
+
+      async function loadHistory() {
+        const list = $('history');
+        try {
+          const { meetings } = await api('/meetings');
+          if (!meetings.length) {
+            list.innerHTML = '<div class="sidebar-empty">还没有会议记录。</div>';
+            return;
+          }
+          const groups = new Map();
+          for (const m of meetings) {
+            const key = dayKey(m.updatedAt);
+            if (!groups.has(key)) groups.set(key, []);
+            groups.get(key).push(m);
+          }
+          list.innerHTML = '';
+          for (const [key, items] of groups) {
+            const head = document.createElement('div');
+            head.className = 'history-group';
+            head.textContent = key;
+            list.append(head);
+            for (const m of items) {
+              const row = document.createElement('div');
+              row.className = 'history-item';
+              row.setAttribute('aria-current', String(m.id === state.meetingId));
+
+              const title = document.createElement('span');
+              title.className = 'history-title';
+              title.textContent = m.title;
+
+              const meta = document.createElement('span');
+              meta.className = 'history-meta';
+              meta.textContent = m.turns ? `${m.turns}轮` : '';
+
+              const del = document.createElement('button');
+              del.className = 'history-del';
+              del.textContent = '×';
+              del.title = '删除这场会议';
+              del.addEventListener('click', async (event) => {
+                event.stopPropagation();
+                if (!confirm(`删除「${m.title}」？该会议的记录会被移除。`)) {
+                  return;
+                }
+                await api('/meetings/' + m.id, { method: 'DELETE' });
+                if (state.meetingId === m.id) {
+                  resetToNew();
+                }
+                loadHistory();
+              });
+
+              row.append(title, meta, del);
+              row.addEventListener('click', () => openMeeting(m.id));
+              list.append(row);
+            }
+          }
+        } catch (error) {
+          list.innerHTML = `<div class="sidebar-empty">${escapeHtml(String(error.message))}</div>`;
+        }
+      }
+
+      /* ── 渲染一场会议 ─────────────────────────────────────── */
+      function bubbleFor(entry) {
+        const row = document.createElement('div');
+        row.className = 'msg' + (entry.role === 'user' ? ' user' : '');
+        const isSummary = entry.stage === 'summary';
+
+        if (entry.role !== 'user') {
+          const avatar = document.createElement('div');
+          avatar.className = 'avatar' + (isSummary ? ' summary' : '');
+          // 席位名去掉末尾序号后取首字母，同一家也能一眼分开
+          avatar.textContent = (entry.speaker || '?').replace(/\d+$/, '').slice(0, 2).toUpperCase();
+          row.append(avatar);
+        }
+
+        const main = document.createElement('div');
+        main.className = 'msg-main';
+
+        if (entry.role !== 'user') {
+          const who = document.createElement('div');
+          who.className = 'msg-who';
+          const name = document.createElement('span');
+          name.className = 'msg-name';
+          name.textContent = isSummary ? `总结者 · ${entry.speaker}` : entry.speaker;
+          who.append(name);
+          if (entry.stage !== 'discussion') {
+            const stage = document.createElement('span');
+            stage.className = 'msg-stage';
+            stage.textContent = STAGE_LABEL[entry.stage] || entry.stage;
+            who.append(stage);
+          }
+          main.append(who);
+        }
+
+        const body = document.createElement('div');
+        body.className = 'msg-body';
+        body.innerHTML =
+          entry.role === 'user'
+            ? escapeHtml(entry.content).replace(/\n/g, '<br>')
+            : render(entry.content);
+        if (isSummary) {
+          body.classList.add('summary-card');
+        }
+        main.append(body);
+        row.append(main);
+        return row;
+      }
+
+      function renderTranscript(meeting) {
+        $('welcome').hidden = true;
+        const column = $('transcript');
+        column.innerHTML = '';
+        for (const turn of meeting.turns) {
+          const wrap = document.createElement('div');
+          wrap.className = 'turn';
+          wrap.append(
+            bubbleFor({ role: 'user', speaker: 'user', stage: 'input', content: turn.userMessage }),
+          );
+          for (const entry of turn.entries) {
+            wrap.append(bubbleFor(entry));
+          }
+          column.append(wrap);
+        }
+        scrollToEnd();
+      }
+
+      function scrollToEnd() {
+        const scroll = $('scroll');
+        requestAnimationFrame(() => {
+          scroll.scrollTop = scroll.scrollHeight;
+        });
+      }
+
+      async function openMeeting(id) {
+        try {
+          const { meeting } = await api('/meetings/' + id);
+          state.meetingId = meeting.id;
+          state.mode = meeting.mode;
+          state.seats = meeting.participants.map((provider) => ({ provider }));
+          state.summarizer = meeting.summarizer;
+          state.summarizerSeat = meeting.summarizerSeat;
+          state.rounds = meeting.rounds;
+
+          $('meetingTitle').textContent = meeting.title;
+          $('meetingMeta').textContent = meeting.turns.length
+            ? `${meeting.turns.length} 轮 · ${meeting.participants.length} 席位`
+            : '';
+          await refreshSeatNames();
+          renderTranscript(meeting);
+          setStatus(
+            'ok',
+            meeting.turns.length ? '继续提问即可接上之前的发言。' : '写下第一个问题。',
+          );
+          loadHistory();
+        } catch (error) {
+          setStatus('err', String(error.message));
+        }
+      }
+
+      function resetToNew() {
+        state.meetingId = null;
+        state.mode = 'round-robin';
+        state.seats = ['chatgpt', 'claude', 'deepseek'].map((provider) => ({ provider }));
+        state.summarizer = 'qwen';
+        state.summarizerSeat = '';
+        state.rounds = 1;
+        $('meetingTitle').textContent = '新会议';
+        $('meetingMeta').textContent = '';
+        $('transcript').innerHTML = '';
+        $('welcome').hidden = false;
+        refreshSeatNames();
+        setStatus('ok', '选好席位，写下第一个问题。');
+        loadHistory();
+      }
+
+      /* ── 设置面板 ─────────────────────────────────────────── */
+      async function renderSettings() {
+        const modeRow = document.querySelectorAll('.mode-row .chip');
+        modeRow.forEach((chip) => {
+          chip.dataset.on = String(chip.dataset.mode === state.mode);
+        });
+        $('modeChip').lastChild.textContent = MODE_LABEL[state.mode];
+
+        const list = $('seatList');
+        list.innerHTML = '';
+        state.seats.forEach((seat, index) => {
+          const row = document.createElement('div');
+          row.className = 'seat';
+
+          const picker = document.createElement('select');
+          for (const id of PROVIDERS) {
+            const option = document.createElement('option');
+            option.value = id;
+            option.textContent = LABELS[id];
+            picker.append(option);
+          }
+          picker.value = seat.provider;
+          picker.addEventListener('change', async () => {
+            seat.provider = picker.value;
+            await refreshSeatNames();
+          });
+
+          const name = document.createElement('span');
+          name.className = 'seat-name';
+          name.textContent = state.seatAliases[index] || '—';
+
+          const up = document.createElement('button');
+          up.className = 'ghost';
+          up.textContent = '↑';
+          up.disabled = index === 0;
+          up.addEventListener('click', async () => {
+            [state.seats[index - 1], state.seats[index]] = [
+              state.seats[index],
+              state.seats[index - 1],
+            ];
+            await refreshSeatNames();
+          });
+
+          const down = document.createElement('button');
+          down.className = 'ghost';
+          down.textContent = '↓';
+          down.disabled = index === state.seats.length - 1;
+          down.addEventListener('click', async () => {
+            [state.seats[index + 1], state.seats[index]] = [
+              state.seats[index],
+              state.seats[index + 1],
+            ];
+            await refreshSeatNames();
+          });
+
+          const remove = document.createElement('button');
+          remove.className = 'ghost';
+          remove.textContent = '×';
+          remove.addEventListener('click', async () => {
+            state.seats.splice(index, 1);
+            await refreshSeatNames();
+          });
+
+          row.append(picker, name, up, down, remove);
+          list.append(row);
+        });
+
+        const seatSelect = $('summarizerSeat');
+        seatSelect.innerHTML = '';
+        const fresh = document.createElement('option');
+        fresh.value = '';
+        fresh.textContent = '新会话';
+        seatSelect.append(fresh);
+        for (const alias of state.seatAliases) {
+          const option = document.createElement('option');
+          option.value = alias;
+          option.textContent = `复用 ${alias}`;
+          seatSelect.append(option);
+        }
+        seatSelect.value = state.summarizerSeat;
+        $('summarizer').value = state.summarizer;
+        $('rounds').value = state.rounds;
+        $('seatHint').textContent = state.summarizerSeat
+          ? `总结会在 ${state.summarizerSeat} 的同一个网页会话里收口，因此它记得自己刚才说了什么。`
+          : '总结者每次都用新会话。留空即如此。';
+
+        $('seatsChipText').textContent = `${state.seats.length} 个席位`;
+        $('seatsChip').dataset.on = String(state.seats.length > 0);
+      }
+
+      /* ── 发送 ─────────────────────────────────────────────── */
+      async function send() {
+        if (state.busy) {
+          return;
+        }
+        const question = $('input').value.trim();
+        if (!question) {
+          return;
+        }
+        if (state.seats.length < 2) {
+          setStatus('err', '会议至少需要两个参与者。');
+          $('settings').dataset.open = 'true';
+          return;
+        }
+
+        state.busy = true;
+        $('sendBtn').disabled = true;
+        $('welcome').hidden = true;
+        $('input').value = '';
+        setStatus('busy', state.mode === 'round-robin' ? '席位依次发言中…' : '席位同时作答中…');
+
+        // 用户气泡先出现，别等网络回来才看到自己说的话
+        const column = $('transcript');
+        const wrap = document.createElement('div');
+        wrap.className = 'turn';
+        wrap.append(
+          bubbleFor({ role: 'user', speaker: 'user', stage: 'input', content: question }),
+        );
+        const pending = document.createElement('div');
+        pending.className = 'msg pending';
+        wrap.append(pending);
+        column.append(wrap);
+        scrollToEnd();
+
+        const template =
+          state.mode === 'parallel' ? 'meeting-parallel-web' : 'meeting-round-robin-web';
+        const body = {
+          model: template,
+          meeting: {
+            participants: state.seats.map((seat) => seat.provider),
+            summarizer: state.summarizer,
+            summarizerSeat: state.summarizerSeat || undefined,
+            rounds: state.rounds,
+          },
+          stream: true,
+          messages: [{ role: 'user', content: question }],
+          ...(state.meetingId ? { conversationId: state.meetingId } : {}),
+        };
+
+        try {
+          const response = await fetch('/v1/chat/completions', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              ...(token() ? { 'x-bridge-token': token() } : {}),
+            },
+            body: JSON.stringify(body),
+          });
+          if (!response.ok) {
+            const raw = await response.text();
+            let message = raw;
+            try {
+              message = JSON.parse(raw)?.error?.message || raw;
+            } catch {
+              /* 保留原文 */
+            }
+            throw new Error(message);
+          }
+
+          let summary = '';
+          const reader = response.body.getReader();
+          const decoder = new TextDecoder();
+          let buffer = '';
+          for (;;) {
+            const chunk = await reader.read();
+            buffer += chunk.done ? decoder.decode() : decoder.decode(chunk.value, { stream: true });
+            let cut;
+            while ((cut = buffer.indexOf('\n\n')) !== -1) {
+              const rawEvent = buffer.slice(0, cut);
+              buffer = buffer.slice(cut + 2);
+              const line = rawEvent.split('\n').find((l) => l.startsWith('data:'));
+              if (!line) continue;
+              const data = line.slice(5).trim();
+              if (!data || data === '[DONE]') continue;
+              let event;
+              try {
+                event = JSON.parse(data);
+              } catch {
+                continue;
+              }
+              if (event.type === 'meeting.started') {
+                state.meetingId = event.meeting.conversationId;
+                $('meetingMeta').textContent = `${state.seats.length} 席位`;
+              } else if (event.type === 'meeting.entry' && event.entry) {
+                pending.remove();
+                wrap.append(bubbleFor(event.entry));
+                scrollToEnd();
+              } else if (event.type === 'meeting.error') {
+                throw new Error(event.error?.message || '会议出错');
+              } else if (event.conversationId) {
+                state.meetingId = event.conversationId;
+              } else {
+                summary += event?.choices?.[0]?.delta?.content || '';
+              }
+            }
+            if (chunk.done) break;
+          }
+
+          pending.remove();
+          if (summary) {
+            const card = document.createElement('div');
+            card.className = 'msg';
+            card.innerHTML =
+              '<div class="avatar summary">Σ</div><div class="msg-main">' +
+              '<div class="msg-who"><span class="msg-name">统一答复</span>' +
+              '<span class="msg-stage">总结</span></div>' +
+              `<div class="msg-body summary-card">${render(summary)}</div></div>`;
+            wrap.append(card);
+            scrollToEnd();
+          }
+          setStatus('ok', '完成。');
+        } catch (error) {
+          pending.remove();
+          setStatus('err', String(error.message));
+        } finally {
+          state.busy = false;
+          $('sendBtn').disabled = $('input').value.trim() === '';
+          if (state.meetingId) {
+            openMeeting(state.meetingId);
+          }
+        }
+      }
+
+      /* ── 绑定 ─────────────────────────────────────────────── */
+      $('sendBtn').addEventListener('click', send);
+      $('input').addEventListener('keydown', (event) => {
+        if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
+          event.preventDefault();
+          send();
+        }
+      });
+      $('input').addEventListener('input', () => {
+        $('sendBtn').disabled = state.busy || $('input').value.trim() === '';
+      });
+      $('newMeetingBtn').addEventListener('click', resetToNew);
+      $('refreshListBtn').addEventListener('click', loadHistory);
+      $('toggleSidebarBtn').addEventListener('click', () => {
+        const sidebar = $('sidebar');
+        sidebar.dataset.open = sidebar.dataset.open === 'true' ? 'false' : 'true';
+      });
+      $('settingsChip').addEventListener('click', () => {
+        const panel = $('settings');
+        panel.dataset.open = panel.dataset.open === 'true' ? 'false' : 'true';
+        $('settingsChip').dataset.on = String(panel.dataset.open === 'true');
+      });
+      $('modeChip').addEventListener('click', () => {
+        $('settings').dataset.open = 'true';
+        $('settingsChip').dataset.on = 'true';
+      });
+      $('seatsChip').addEventListener('click', () => {
+        $('settings').dataset.open = 'true';
+        $('settingsChip').dataset.on = 'true';
+      });
+      for (const chip of document.querySelectorAll('.mode-row .chip')) {
+        chip.addEventListener('click', async () => {
+          state.mode = chip.dataset.mode;
+          await refreshSeatNames();
+        });
+      }
+      $('addSeatBtn').addEventListener('click', async () => {
+        const used = new Set(state.seats.map((s) => s.provider));
+        state.seats.push({ provider: PROVIDERS.find((id) => !used.has(id)) ?? PROVIDERS[0] });
+        await refreshSeatNames();
+      });
+      $('summarizer').addEventListener('change', async () => {
+        state.summarizer = $('summarizer').value;
+        await refreshSeatNames();
+      });
+      $('summarizerSeat').addEventListener('change', async () => {
+        state.summarizerSeat = $('summarizerSeat').value;
+        await refreshSeatNames();
+      });
+      $('rounds').addEventListener('change', () => {
+        state.rounds = Number($('rounds').value) || 1;
+      });
+      $('meetingTitle').addEventListener('click', () => {
+        if (!state.meetingId) return;
+        const input = document.createElement('input');
+        input.className = 'title-input';
+        input.value = $('meetingTitle').textContent;
+        $('meetingTitle').replaceWith(input);
+        input.focus();
+        input.select();
+        const commit = async () => {
+          const title = input.value.trim();
+          if (title) {
+            await api('/meetings/' + state.meetingId, {
+              method: 'PATCH',
+              body: JSON.stringify({ title }),
+            });
+            $('meetingTitle').textContent = title;
+            loadHistory();
+          }
+          const h = document.createElement('h1');
+          h.id = 'meetingTitle';
+          h.textContent = title;
+          h.addEventListener('click', () => $('meetingTitle').click());
+          input.replaceWith(h);
+        };
+        input.addEventListener('blur', commit);
+        input.addEventListener('keydown', (event) => {
+          if (event.key === 'Enter') input.blur();
+        });
+      });
+
+      /* ── 启动 ─────────────────────────────────────────────── */
+      (async function boot() {
+        const summarizer = $('summarizer');
+        for (const id of PROVIDERS) {
+          const option = document.createElement('option');
+          option.value = id;
+          option.textContent = LABELS[id];
+          summarizer.append(option);
+        }
+        summarizer.value = state.summarizer;
+        await refreshSeatNames();
+        loadHistory();
+      })();
+    </script>
+  </body>
+</html>

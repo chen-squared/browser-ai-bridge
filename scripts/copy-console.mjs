@@ -15,4 +15,7 @@ const to = resolve(toDir, 'index.html');
 mkdirSync(toDir, { recursive: true });
 copyFileSync(from, to);
 
+// 会议页是独立入口（/meeting），同样要拷过去
+copyFileSync(resolve(root, 'src/console/meeting.html'), resolve(toDir, 'meeting.html'));
+
 console.log(`控制台入口页 → ${to}`);

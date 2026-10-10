@@ -14,6 +14,7 @@ const schema = z.object({
   USER_DATA_DIR: z.string().default('.sessions/chromium'),
   SELECTOR_OVERRIDES_PATH: z.string().default('selectors.overrides.json'),
   CONVERSATION_URL_STORE_PATH: z.string().default('.sessions/conversation-urls.json'),
+  MEETING_STORE_PATH: z.string().default('.sessions/meetings.json'),
   DEFAULT_PROVIDER: z
     .enum(['chatgpt', 'gemini', 'claude', 'grok', 'qwen', 'deepseek'])
     .default('chatgpt'),
@@ -52,6 +53,7 @@ export const appConfig = {
   userDataDir: path.resolve(process.cwd(), parsed.USER_DATA_DIR),
   selectorOverridesPath: path.resolve(process.cwd(), parsed.SELECTOR_OVERRIDES_PATH),
   conversationUrlStorePath: path.resolve(process.cwd(), parsed.CONVERSATION_URL_STORE_PATH),
+  meetingStorePath: path.resolve(process.cwd(), parsed.MEETING_STORE_PATH),
   defaultProvider: parsed.DEFAULT_PROVIDER,
   browserChannel: parsed.BROWSER_CHANNEL,
   chromeExecutablePath: parsed.CHROME_EXECUTABLE_PATH,
