@@ -26,6 +26,13 @@ const selectorOverrideSchema = z.object({
   streamCapture: z
     .object({
       endpointPattern: z.string(),
+      /**
+       * CDP `Fetch.enable` 要的是 glob 而不是正则。配了就走**增量捕获**那条路：
+       * 站点把流一直挂着不关闭时，`response.finished()` 永远不 resolve，
+       * `response.body()` 直接抛 `No data found`，整条真流就废了。
+       * 不配则只走 finished()+body()（对会正常收尾的响应仍然够用）。
+       */
+      endpointGlob: z.string().optional(),
       transport: z.enum(['http', 'websocket']),
       /**
        * 每个 reducer 对应一套协议，**不能跨 provider 复用**：
@@ -73,14 +80,23 @@ const defaultProviders: Record<ProviderId, ProviderConfig> = {
     urlPatterns: ['chatgpt.com'],
     titleHints: ['chatgpt'],
     inputSelectors: [
-      'div.ProseMirror#prompt-textarea',
+      // 2026-10 实测：`id="prompt-textarea"` 也**已被移除**，输入框现在只剩
+      // contenteditable + role=textbox。旧的 #prompt-textarea 选择器命中数为 0，
+      // 靠列表末尾那条兜底还能打字，但排在前面会白白多等一轮超时。
+      'div[data-composer-markdown][contenteditable="true"]',
+      'div[contenteditable="true"][role="textbox"][aria-label*="询问"]',
+      'div[contenteditable="true"][role="textbox"]',
       'div.ProseMirror[contenteditable="true"]',
+      'div.ProseMirror#prompt-textarea',
       'div#prompt-textarea[contenteditable="true"][role="textbox"]',
-      'div[role="textbox"][contenteditable="true"]#prompt-textarea',
       'div[contenteditable="true"][data-testid="composer"]',
-      'div[role="textbox"][contenteditable="true"]',
     ],
     sendButtonSelectors: [
+      // 2026-10 实测：`data-testid="send-button"` **已被移除**（命中数为 0），
+      // 发送按钮现在只靠 aria-label 标识。保留旧写法只是无害的前缀匹配，
+      // 但真正起作用的是后面这两条——改版时只按 testid 找会直接静默失效。
+      'button[aria-label="发送"]',
+      'button[aria-label="Send message"]',
       'button[data-testid="send-button"]',
       'button[aria-label*="发送"]',
       'button[aria-label*="Send"]',
@@ -96,6 +112,11 @@ const defaultProviders: Record<ProviderId, ProviderConfig> = {
       'button[title*="复制"]',
     ],
     responseSelectors: [
+      // 2026-10 实测：新版把整篇对话换成了新组件——`article`、
+      // `data-message-author-role`、`conversation-turn-*`、`.markdown` 全部命中 0。
+      // 现在正文是 `p[class*="TextBase"]`（尾号是构建哈希，前缀稳定）。
+      'p[class*="TextBase"]',
+      '[class*="TextBase"]',
       '[data-message-author-role="assistant"]',
       'article[data-testid^="conversation-turn-"] [data-message-author-role="assistant"]',
     ],
@@ -105,6 +126,11 @@ const defaultProviders: Record<ProviderId, ProviderConfig> = {
     // 所以切帧必须 event/data 成对，不能只取块首的 data:。
     streamCapture: {
       endpointPattern: '\\/backend-api\\/f\\/conversation$',
+      // 2026-10 实测：ChatGPT 不再关闭这条 SSE——答案 +15s 就完成，连接还挂着，
+      // 于是 finished() 一直不 resolve、body() 抛 No data found，真流整条丢失，
+      // 只能退回 DOM（而新 DOM 里连 article / data-message-author-role 都没了）。
+      // 所以这里必须走 CDP Fetch 的增量读，逐块取，不等它结束。
+      endpointGlob: '*backend-api/f/conversation',
       transport: 'http',
       reducer: 'chatgpt',
     },

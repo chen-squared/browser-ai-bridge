@@ -535,9 +535,95 @@ describe('reduceChatgptStream', () => {
     assert.equal(reduceChatgptStream([]), undefined);
   });
 
+  it('新版快照形状：从 content.parts 取正文，而不是只 push 空壳', () => {
+    // 2026-10 实测形状：整条 message 快照，**没有** /message/content/parts/N 补丁。
+    // 旧实现在这里只登记一条空 message，于是真流明明抓到了、正文却是空字符串。
+    const snapshot = JSON.stringify({
+      v: {
+        message: {
+          id: 'm1',
+          author: { role: 'assistant' },
+          content: { content_type: 'text', parts: ['皑皑'] },
+          status: 'in_progress',
+        },
+      },
+    });
+
+    assert.equal(reduceChatgptStream([snapshot])?.content, '皑皑');
+    assert.equal(
+      reduceChatgptStream([snapshot])?.finished,
+      false,
+      '单看一条快照还没结束标记，不能算 finished',
+    );
+  });
+
+  it('新版快照形状：附件部件不是字符串时被跳过', () => {
+    const snapshot = JSON.stringify({
+      v: {
+        message: {
+          author: { role: 'assistant' },
+          content: {
+            content_type: 'multimodal_text',
+            parts: [{ asset_pointer: 'x' }, '正文'],
+          },
+        },
+      },
+    });
+
+    assert.equal(reduceChatgptStream([snapshot])?.content, '正文');
+  });
+
+  it('新版快照形状：model_editable_context 这类没有 parts 数组的不产出正文', () => {
+    const snapshot = JSON.stringify({
+      v: {
+        message: {
+          author: { role: 'assistant' },
+          content: { content_type: 'model_editable_context', model_set_context: '' },
+        },
+      },
+    });
+
+    // 既没有正文也没有结束标记，归约不出来——这正是旧实现把答案漏成空的原因。
+    assert.equal(reduceChatgptStream([snapshot]), undefined);
+  });
+
   function reducedId() {
     return reduceChatgptStream(frames)?.conversationId;
   }
+});
+
+describe('ChatGPT —— 真实流捕获（2026-10 实测）', () => {
+  /**
+   * 一次真实发送的完整 SSE：12389 字节。ChatGPT 现在**不再关闭这条连接**，
+   * 所以它只能靠 CDP Fetch 增量读回来——finished() 永远不 resolve，body() 直接抛错。
+   */
+  const REAL = readFileSync(
+    new URL('./fixtures/chatgpt-snapshot-stream.txt', import.meta.url),
+    'utf8',
+  );
+
+  it('还原出正文「皑皑」', () => {
+    const reduced = reduceChatgptStream(parseSseEvents(REAL).map((event) => event.data));
+    assert.ok(reduced);
+    assert.equal(reduced!.content, '皑皑');
+  });
+
+  it('认出站点自己标记的结束', () => {
+    const reduced = reduceChatgptStream(parseSseEvents(REAL).map((event) => event.data));
+    assert.equal(reduced?.finished, true);
+  });
+
+  it('拿到会话 id', () => {
+    const reduced = reduceChatgptStream(parseSseEvents(REAL).map((event) => event.data));
+    assert.match(reduced?.conversationId ?? '', /^[0-9a-f-]{36}$/);
+  });
+
+  it('不把提示词当成回答', () => {
+    // 用户那条消息也在流里（role: user, parts: ["用两字形容雪"]），
+    // 取错了就会把刚发出去的那句话原样返回。
+    const reduced = reduceChatgptStream(parseSseEvents(REAL).map((event) => event.data));
+    assert.notEqual(reduced?.content, '用两字形容雪');
+  });
 });
 
 describe('reduceClaudeConversation', () => {

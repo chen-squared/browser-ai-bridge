@@ -759,20 +759,51 @@ export function reduceChatgptStream(frames: readonly string[]): ReducedStream | 
     const op = frame['o'];
     const value = frame['v'];
 
+    // 2026-10 起 ChatGPT 改成**整条 message 快照**：正文已经躺在 content.parts 里，
+    // 不再靠 /message/content/parts/N 的补丁逐字追加。旧代码在这里只 push 一个空壳，
+    // 于是真流明明抓到了、归约出来却是空字符串（实测 12389 字节的流归约成 content:""）。
+    const fromSnapshot = (raw: unknown): Message | undefined => {
+      const incoming = raw as
+        | {
+            message?: {
+              author?: { role?: string };
+              status?: string;
+              content?: { content_type?: string; parts?: unknown };
+            };
+          }
+        | undefined;
+      const source = incoming?.message;
+      const role = source?.author?.role;
+      if (!role) {
+        return undefined;
+      }
+      const message = blank(role);
+      message.status = source?.status;
+      const parts = source?.content?.parts;
+      // 附件/图片部件是对象，只留字符串。model_editable_context 那种 parts 不是
+      // 数组（是单个字符串），这里直接跳过，等真正带正文的快照。
+      if (Array.isArray(parts)) {
+        message.parts = parts.filter((part): part is string => typeof part === 'string');
+      }
+      return message;
+    };
+
     // 整条新增 message
     if (path === '' && op === 'add' && value && typeof value === 'object') {
-      sawFrame = true;
-      const incoming = value as { message?: { author?: { role?: string }; status?: string } };
-      messages.push(blank(incoming.message?.author?.role));
+      const message = fromSnapshot(value);
+      if (message) {
+        sawFrame = true;
+        messages.push(message);
+      }
       return;
     }
 
     // 整条替换当前 message（无 p 无 o，只有 v.message）
     if (path === undefined && op === undefined && value && typeof value === 'object') {
-      const incoming = value as { message?: { author?: { role?: string }; status?: string } };
-      if (incoming.message?.author?.role) {
+      const message = fromSnapshot(value);
+      if (message) {
         sawFrame = true;
-        messages.push(blank(incoming.message.author.role));
+        messages.push(message);
       }
       return;
     }

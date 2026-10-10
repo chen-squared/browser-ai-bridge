@@ -654,27 +654,19 @@ export class ProviderClient {
     }
 
     const minimumResponseBlocks = 1;
-    const responseTexts = await this.waitForStableResponses(
-      page,
-      provider,
-      existingResponseCount,
-      existingResponseCountsBySelector,
-      minimumResponseBlocks,
-      {
-        latestUserMessage: normalizedPrompt.latestUserMessage,
-        fullPrompt: prompt,
-      },
-    );
 
     // 真流优先。正文与思考内容由协议里的 phase 字段区分，不必再从 DOM 里猜哪个块
     // 是答案（此前就因为抓错块把 DeepSeek 的思考过程当成了回复）。捕获不到就
     // 照旧用 DOM 结果，功能不受影响。
-    // 真流优先，但**要等它到**。HTTP 流的 body 只能在响应结束后取到，而那条响应
-    // 往往比 DOM"稳定"更晚结束（实测 ChatGPT 的 finished() 要 11 秒）。不等的话
-    // 这里必然取不到，就静默退回 DOM——而 ChatGPT 的 DOM 里混着"思考/搜索网页"
-    // 这类按钮文字，于是抓出 `思考\n创建图像或贴纸…` 这种垃圾。
-    const captured = await this.awaitCapturedStream(page, streamSentAt);
-    if (captured?.content && !isPlaceholderArtifactText(captured.content)) {
+    //
+    // 真流优先，但**要等它到**。真流往往比 DOM"稳定"更晚到（实测 ChatGPT 要 5 秒
+    // 才把整条流吐完），不等就取不到，就静默退回 DOM——而 ChatGPT 新版 DOM 里
+    // `article` / `data-message-author-role` 全没了，只会抓出侧栏的「没有项目」。
+    const streamResult = async (): Promise<ChatResult | undefined> => {
+      const captured = await this.awaitCapturedStream(page, streamSentAt);
+      if (!captured?.content || isPlaceholderArtifactText(captured.content)) {
+        return undefined;
+      }
       this.extractionDebugItems.push({
         index: 0,
         method: 'html',
@@ -695,6 +687,59 @@ export class ProviderClient {
         },
         content: captured.content,
       };
+    };
+
+    let responseTexts: string[];
+    // 两条路**同时**跑，谁先到谁说话。真流优先的言下之意就是"不用等 DOM"：
+    // 站点改版后 DOM 那条会拖很久（ChatGPT 实测要 30 秒才判定失败），
+    // 而真流 8 秒就有答案了。串行等待等于把两个耗时相加。
+    const streamTask = streamResult();
+    const domTask = this.waitForStableResponses(
+      page,
+      provider,
+      existingResponseCount,
+      existingResponseCountsBySelector,
+      minimumResponseBlocks,
+      {
+        latestUserMessage: normalizedPrompt.latestUserMessage,
+        fullPrompt: prompt,
+      },
+    ).then(
+      (texts) => ({ ok: true, texts }) as { ok: true; texts: string[] } | { ok: false; error: unknown },
+      (error: unknown) => ({ ok: false, error }) as { ok: true; texts: string[] } | { ok: false; error: unknown },
+    );
+
+    const first = await Promise.race([
+      streamTask.then((result) => ({ source: 'stream' as const, result })),
+      domTask.then((outcome) => ({ source: 'dom' as const, outcome })),
+    ]);
+
+    if (first.source === 'stream') {
+      if (first.result) {
+        return first.result;
+      }
+      // 流等满窗口没拿到内容，接着走 DOM。
+      const outcome = await domTask;
+      if (!outcome.ok) {
+        throw outcome.error;
+      }
+      responseTexts = outcome.texts;
+    } else if (!first.outcome.ok) {
+      // **DOM 失败不代表这一轮白发了。** 站点改版时 DOM 抽取会先崩，而真流其实
+      // 早就抓到了完整答案。原先这里是直接往上抛，让 server 回退到 latest-response
+      // 再抓一次 DOM——于是明明有权威数据，却返回了侧栏的「没有项目」。
+      const fromStream = await streamTask;
+      if (fromStream) {
+        return fromStream;
+      }
+      throw first.outcome.error;
+    } else {
+      responseTexts = first.outcome.texts;
+      // DOM 先好了，但真流仍是权威：拿到了就用它。
+      const fromStream = await streamTask;
+      if (fromStream) {
+        return fromStream;
+      }
     }
 
     const filteredResponseTexts = responseTexts.filter(

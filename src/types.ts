@@ -55,6 +55,13 @@ export type ProviderConfig = {
      */
     endpointPattern: string;
     /**
+     * CDP `Fetch.enable` 用的 glob。配了就走**增量捕获**：不等响应结束就逐块读正文。
+     *
+     * 站点把流一直挂着不关闭时（ChatGPT 2026-10 起就是这样），`response.finished()`
+     * 永远不 resolve，`response.body()` 抛 `No data found`，真流会整条丢失。
+     */
+    endpointGlob?: string;
+    /**
      * 传输方式。
      *
      * `http` 的流走 fetch，只能在请求结束后一次性取到完整 body，**没有首字延迟**。

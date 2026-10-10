@@ -1,4 +1,4 @@
-import { chromium, type BrowserContext, type Locator, type Page } from 'playwright';
+import { chromium, type BrowserContext, type CDPSession, type Locator, type Page } from 'playwright';
 import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { appConfig } from '../config.js';
@@ -37,6 +37,9 @@ type CapturedFrame = {
 
 /** 闲置超过此时长的标签页会被回收。 */
 const SESSION_IDLE_EVICT_MS = 2 * 60 * 60 * 1000;
+
+/** 增量捕获的单次响应最多读多少块。64KB 一块，几百块足够覆盖任何正常回答。 */
+const INCREMENTAL_STREAM_MAX_READS = 500;
 /**
  * 每个 provider 最多保留多少个标签页。
  *
@@ -367,6 +370,10 @@ export class BrowserManager {
     const recorded = this.capturedStreams.get(page) ?? [];
     this.capturedStreams.set(page, recorded);
 
+    if (provider.streamCapture.endpointGlob) {
+      void this.attachIncrementalStreamCapture(page, provider.streamCapture.endpointGlob, pattern, recorded);
+    }
+
     page.on('response', (response) => {
       if (!pattern.test(response.url())) {
         return;
@@ -386,6 +393,78 @@ export class BrowserManager {
         } catch {
           // 流式响应取不到 body 是正常的（可能已断开或被浏览器回收）；忽略即可，
           // 上层会退回 DOM 轮询路径。
+        }
+      })();
+    });
+  }
+
+  /**
+   * 增量捕获：不等响应结束，边下边把正文取回来。
+   *
+   * 为什么需要这条：站点把 SSE 一直挂着不关闭时，`response.finished()` 永远不
+   * resolve，`response.body()` 会直接抛 `Network.getResponseBody: No data found`。
+   * ChatGPT 2026-10 就是这样——答案 15 秒就出来了，连接还挂着，真流整条丢失。
+   * 走 CDP `Fetch` 域可以逐块读，不用等它收尾。
+   *
+   * 两个必须记住的坑：
+   *   1. **先** `takeResponseBodyAsStream` **再** `continueResponse`。反过来
+   *      拦截号立刻失效（`Invalid InterceptionId`）。
+   *   2. 任何分支都必须把请求放行，否则页面会卡在那个响应上不动。
+   */
+  private async attachIncrementalStreamCapture(
+    page: Page,
+    endpointGlob: string,
+    pattern: RegExp,
+    recorded: CapturedStream[],
+  ): Promise<void> {
+    let cdp: CDPSession;
+    try {
+      cdp = await page.context().newCDPSession(page);
+      await cdp.send('Fetch.enable', {
+        patterns: [{ urlPattern: endpointGlob, requestStage: 'Response' }],
+      });
+    } catch {
+      // 这条路走不通不影响功能：上层照旧退回 response + DOM。
+      return;
+    }
+
+    cdp.on('Fetch.requestPaused', (event) => {
+      void (async () => {
+        if (!pattern.test(event.request.url)) {
+          await cdp.send('Fetch.continueResponse', { requestId: event.requestId }).catch(() => undefined);
+          return;
+        }
+
+        // 时间基准同样是**响应开始**的时刻，理由见上面 page.on('response') 那段注释。
+        const startedAt = Date.now();
+        try {
+          const { stream } = await cdp.send('Fetch.takeResponseBodyAsStream', {
+            requestId: event.requestId,
+          });
+          // 放行与读流并行：页面要拿到数据，我们也要拿到正文。
+          void cdp.send('Fetch.continueResponse', { requestId: event.requestId }).catch(() => undefined);
+
+          // 先占位、边读边往里写，而不是读完再 push：上层只等 18 秒，
+          // 等读完再登记的话，这一轮已经超时退回 DOM 了。同一对象原地更新，
+          // 所以数组里不会堆积半成品条目。
+          const entry: CapturedStream = { url: event.request.url, text: '', capturedAt: startedAt };
+          recorded.push(entry);
+
+          for (let read = 0; read < INCREMENTAL_STREAM_MAX_READS; read += 1) {
+            const chunk = await cdp.send('IO.read', { handle: stream, size: 64 * 1024 });
+            if (chunk.data) {
+              entry.text += chunk.base64Encoded
+                ? Buffer.from(chunk.data, 'base64').toString('utf8')
+                : chunk.data;
+            }
+            if (chunk.eof) {
+              break;
+            }
+          }
+          await cdp.send('IO.close', { handle: stream }).catch(() => undefined);
+        } catch {
+          // 取流失败也要放行，否则页面永远等不到这个响应。
+          await cdp.send('Fetch.continueResponse', { requestId: event.requestId }).catch(() => undefined);
         }
       })();
     });
