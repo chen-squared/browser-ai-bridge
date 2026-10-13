@@ -921,23 +921,9 @@
                 <input type="text" id="conversationId" placeholder="留空即新会话" />
               </label>
 
-              <div class="row">
-                <label class="field">
-                  <span class="field-label">智能搜索</span>
-                  <select id="searchMode">
-                    <option value="auto">auto</option>
-                    <option value="on" selected>on</option>
-                    <option value="off">off</option>
-                  </select>
-                </label>
-                <label class="field">
-                  <span class="field-label">深度思考</span>
-                  <select id="reasoningMode">
-                    <option value="auto">auto</option>
-                    <option value="on" selected>on</option>
-                    <option value="off">off</option>
-                  </select>
-                </label>
+              <div class="hint">
+                联网搜索与深度思考一律开启。实测：搜索确实会让回答更长（点的是站点自己的按钮），
+                深度思考则基本观察不到差别，所以不再提供开关。
               </div>
 
               <div class="btn-row">
@@ -1044,6 +1030,8 @@
       const $ = (id) => document.getElementById(id);
 
       const PROVIDERS = ['chatgpt', 'claude', 'deepseek', 'grok', 'qwen', 'gemini'];
+      /** 并排提问时相邻两个模型之间的启动间隔，理由见 sendAll 里的注释。 */
+      const PARALLEL_STAGGER_MS = 1500;
 
       /** provider 的展示名。中文界面里英文 id 太难认。 */
       const LABELS = {
@@ -1262,15 +1250,30 @@
         });
       }
 
-      /* ── 健康状态 ───────────────────────────────────────────── */
+      /* ── 健康状态 ─────────────────────────────────────────────
+         红点只该在**真的连不上**时亮。原来任何一次失败就转红、20 秒后才重试，
+         手机息屏再唤醒时那个被掐断的请求正好落在这里，于是"其实连着"却一直
+         显示红点。所以：网络错误才叫连不上，HTTP 错误单独说；回到前台立刻复查，
+         失败后 3 秒就重试而不是干等一个轮询周期。
+      ─────────────────────────────────────────────────────── */
       async function refreshHealth() {
         const badge = $('healthBadge');
         const text = $('healthText');
         try {
-          const payload = await api('/health');
+          const response = await fetch('/health', {
+            headers: withToken({}),
+            cache: 'no-store',
+          });
+          if (!response.ok) {
+            badge.dataset.state = 'bad';
+            text.textContent = `服务返回 ${response.status}`;
+            return;
+          }
+          const payload = await response.json();
           badge.dataset.state = payload.ok ? 'ok' : 'bad';
           text.textContent = payload.headless ? '运行中（无头）' : '运行中';
-        } catch (error) {
+        } catch {
+          // fetch 抛错才是真的连不上（服务没起、地址不通、Tailscale 断了）。
           badge.dataset.state = 'bad';
           text.textContent = '连不上';
         }
@@ -1385,13 +1388,6 @@
         return entry;
       }
 
-      /** 下拉框的三态 → 请求字段：'auto' 表示不干预，传 undefined。 */
-      function searchFlag(value) {
-        if (value === 'on') return true;
-        if (value === 'off') return false;
-        return undefined;
-      }
-
       function setStatus(node, tone, message) {
         node.dataset.tone = tone;
         node.textContent = message;
@@ -1428,27 +1424,41 @@
         $('stopBtn').disabled = false;
 
         const started = Date.now();
-        const jobs = picked.map(async (id) => {
-          const entry = ensureCard(id);
-          const t0 = Date.now();
-          try {
-            await runOne(id, entry, controller.signal);
-            const seconds = ((Date.now() - t0) / 1000).toFixed(1);
-            entry.time.textContent = seconds + 's';
-          } catch (error) {
-            entry.time.textContent = '—';
-            if (error?.name === 'AbortError') {
-              entry.body.innerHTML = '<p class="faint">已中断。</p>';
-            } else {
-              entry.body.innerHTML = '';
-              const box = document.createElement('div');
-              box.className = 'status';
-              box.dataset.tone = 'err';
-              box.textContent = String(error?.message || error);
-              entry.body.append(box);
-            }
+        // 错峰启动，不要一次性全发出去。
+        //
+        // 同一个浏览器里每个 provider 都要新开标签页并加载重 SPA，同时起就互相抢
+        // 资源——实测只要 ChatGPT 在其中，同场的 Gemini 就会抓不到回答，Claude 更会
+        // 退回抓首屏问候语。隔 PARALLEL_STAGGER_MS 再起下一个，总耗时仍然接近最慢的
+        // 那一个（还是并行），但不会在页面都还没加载完的时候一起冲进去。
+        const jobs = [];
+        for (const [index, id] of picked.entries()) {
+          if (index > 0) {
+            await new Promise((resolve) => setTimeout(resolve, PARALLEL_STAGGER_MS));
           }
-        });
+          jobs.push(
+            (async () => {
+              const entry = ensureCard(id);
+              const t0 = Date.now();
+              try {
+                await runOne(id, entry, controller.signal);
+                const seconds = ((Date.now() - t0) / 1000).toFixed(1);
+                entry.time.textContent = seconds + 's';
+              } catch (error) {
+                entry.time.textContent = '—';
+                if (error?.name === 'AbortError') {
+                  entry.body.innerHTML = '<p class="faint">已中断。</p>';
+                } else {
+                  entry.body.innerHTML = '';
+                  const box = document.createElement('div');
+                  box.className = 'status';
+                  box.dataset.tone = 'err';
+                  box.textContent = String(error?.message || error);
+                  entry.body.append(box);
+                }
+              }
+            })(),
+          );
+        }
 
         await Promise.all(jobs);
 
@@ -1490,11 +1500,10 @@
           model: id + '-web',
           messages: [{ role: 'user', content: $('prompt').value.trim() }],
           stream: true,
-          // schema 要的是 boolean，这里原来直接传 'on'/'off'/'auto' 字符串，
-          // 选「off」或「auto」就会被 Zod 拒掉（invalid_type: expected boolean）。
-          // 'auto' = 不传这个字段，保持网页当前状态。
-          enableSearch: searchFlag($('searchMode').value),
-          enableReasoning: searchFlag($('reasoningMode').value),
+          // 一律开启。开关已经去掉：搜索确实有用（点了站点自己的按钮，回答会变长），
+          // 深度思考开着也没什么坏处，索性省掉这两个下拉框。
+          enableSearch: true,
+          enableReasoning: true,
         };
         const existingConv = loadConv(id);
         if (existingConv) {
@@ -1714,6 +1723,17 @@
           showTokenGate('尚未提供访问令牌，所有接口都会返回 401。');
         }
       }
+
+      // 手机息屏时定时器会被冻结，唤醒后那个被掐断的请求会把徽章留在红色。
+      // 回到前台立刻复查一次，别让人盯着一个假警报。
+      document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'visible') {
+          refreshHealth();
+        }
+      });
+
+      window.addEventListener('online', refreshHealth);
+      window.addEventListener('pageshow', refreshHealth);
 
       boot();
     </script>

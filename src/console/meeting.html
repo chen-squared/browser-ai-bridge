@@ -134,6 +134,11 @@
         padding: 12px 12px 8px;
       }
 
+      /* 窄屏下侧栏是整屏浮层，桌面端并排放，用不着关闭键 */
+      .sidebar-close {
+        display: none;
+      }
+
       .brand {
         flex: 1;
         font-size: 13px;
@@ -765,6 +770,81 @@
         font-size: 12px;
       }
 
+      /* 正在逐字冒出来的气泡：光标一闪，让人一眼看出"还在写"。 */
+      .msg.streaming .msg-body::after {
+        content: '';
+        display: inline-block;
+        width: 7px;
+        height: 1.05em;
+        margin-left: 2px;
+        vertical-align: text-bottom;
+        background: var(--ink-dim);
+        animation: caret 1s steps(2, start) infinite;
+      }
+
+      /* 还没出字：把"正在写…"写清楚，别让人对着光标猜 */
+      .msg.speaking .msg-body {
+        color: var(--ink-faint);
+      }
+
+      /* ── 折叠 ─────────────────────────────────────────────────
+         一轮下来五六个模型各写几百字，时间线会被拉得很长。
+         收起时留一行预览，不至于连"谁说了什么"都看不见。
+      ─────────────────────────────────────────────────────── */
+      .msg-caret {
+        flex: none;
+        width: 20px;
+        height: 20px;
+        margin-left: auto;
+        border: none;
+        border-radius: 5px;
+        background: none;
+        color: var(--ink-faint);
+        font-size: 12px;
+        line-height: 1;
+        cursor: pointer;
+      }
+
+      .msg-caret:hover {
+        background: var(--bg-soft);
+        color: var(--ink);
+      }
+
+      .msg-preview {
+        display: none;
+        color: var(--ink-faint);
+        font-size: 13px;
+        line-height: 1.6;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .msg.collapsed .msg-body {
+        display: none;
+      }
+
+      .msg.collapsed .msg-preview {
+        display: block;
+      }
+
+      /* 折叠中的气泡不显示光标，免得看着像还在写 */
+      .msg.collapsed.streaming .msg-body::after {
+        display: none;
+      }
+
+      @keyframes caret {
+        50% {
+          opacity: 0;
+        }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        .msg.streaming .msg-body::after {
+          animation: none;
+        }
+      }
+
       @media (max-width: 760px) {
         .app {
           grid-template-columns: 1fr;
@@ -779,6 +859,15 @@
           position: fixed;
           inset: 0;
           z-index: 30;
+        }
+
+        .sidebar-close {
+          display: inline-flex;
+        }
+
+        /* 浮层开着的时候锁住背景滚动，否则手指在列表上滑会连带把正文带着动 */
+        body[data-sidebar='open'] {
+          overflow: hidden;
         }
       }
 
@@ -810,6 +899,12 @@
         <div class="sidebar-head">
           <div class="brand"><a href="/">← 控制台</a></div>
           <button class="ghost" id="refreshListBtn" title="刷新列表">↻</button>
+          <!--
+            窄屏下侧栏是 position:fixed; inset:0 的整屏浮层，会把顶栏那个 ☰
+            盖得严严实实，点都点不到，于是"打开了就关不掉"。这个 ✕ 只在窄屏出现
+            （桌面端侧栏本来就是并排的一列，用不着）。
+          -->
+          <button class="ghost sidebar-close" id="closeSidebarBtn" title="关闭列表">✕</button>
         </div>
         <button class="new-meeting" id="newMeetingBtn">＋ 发起新会议</button>
         <div class="history" id="history"></div>
@@ -893,6 +988,8 @@
       const $ = (id) => document.getElementById(id);
 
       const PROVIDERS = ['chatgpt', 'claude', 'deepseek', 'grok', 'qwen', 'gemini'];
+      /** 席位数上限。与服务端 z.array(...).max(6) 对齐，别让界面能造出非法请求。 */
+      const MAX_SEATS = 6;
       const LABELS = {
         chatgpt: 'ChatGPT',
         claude: 'Claude',
@@ -913,6 +1010,10 @@
         summarizerSeat: '',
         rounds: 1,
         seatAliases: [],
+        /** 服务端给的 {alias, provider}。复用列表按 provider 过滤，所以两者都要留。 */
+        planParticipants: [],
+        /** 本轮容器；实时气泡和最终发言都挂在它下面，顺序才不会乱。 */
+        turnWrap: null,
         busy: false,
       };
 
@@ -929,6 +1030,17 @@
 
       function token() {
         try {
+          // 也认 URL 上的 ?token=，和入口页保持一致。否则手机浏览器从收藏夹
+          // 打开 /meeting（地址栏里没带令牌）必然落进令牌闸门，得手抄一遍。
+          const fromUrl = new URLSearchParams(location.search).get('token');
+          if (fromUrl) {
+            try {
+              sessionStorage.setItem('bridge.token', fromUrl);
+            } catch {
+              /* 隐私模式写不了，内存里的这份本次会话仍然有效 */
+            }
+            return fromUrl;
+          }
           return sessionStorage.getItem('bridge.token') || '';
         } catch {
           return '';
@@ -1011,7 +1123,7 @@
 
       /* ── 席位名由服务端算 ──────────────────────────────────────
          席位名同时是会话身份（进 conversationId），前端自己算一遍
-         就可能和��务端漂移，静默复用错会话。只认 /meeting/plan。 */
+         就可能和服务端漂移，静默复用错会话。只认 /meeting/plan。 */
       async function refreshSeatNames() {
         try {
           const plan = await api('/meeting/plan', {
@@ -1024,16 +1136,22 @@
               ...(state.summarizerSeat ? { summarizerSeat: state.summarizerSeat } : {}),
             }),
           });
+          // alias 与 provider 一起留着：复用列表要按 provider 过滤，
+          // 光有别名看不出背后是哪个模型。
+          state.planParticipants = plan.participants;
           state.seatAliases = plan.participants.map((p) => p.alias);
         } catch {
+          // 服务端拒绝（比如复用了不属于总结者的席位）时，别把上一次的席位名
+          // 留着继续用——那正是"界面显示复用、实际开新会话"的来源。
           const counters = new Map();
-          state.seatAliases = state.seats.map((seat) => {
+          state.planParticipants = state.seats.map((seat) => {
             const n = (counters.get(seat.provider) ?? 0) + 1;
             counters.set(seat.provider, n);
-            return `${seat.provider}${n}`;
+            return { alias: `${seat.provider}${n}`, provider: seat.provider };
           });
+          state.seatAliases = state.planParticipants.map((p) => p.alias);
         }
-        if (!state.seatAliases.includes(state.summarizerSeat)) {
+        if (state.summarizerSeat && !state.seatAliases.includes(state.summarizerSeat)) {
           state.summarizerSeat = '';
         }
         renderSettings();
@@ -1105,7 +1223,13 @@
               });
 
               row.append(title, meta, del);
-              row.addEventListener('click', () => openMeeting(m.id));
+              row.addEventListener('click', () => {
+                openMeeting(m.id);
+                // 浮层打开时它盖住了整屏，点完必须自己关掉，不然正文永远看不见
+                if ($('sidebar').dataset.open === 'true') {
+                  setSidebar(false);
+                }
+              });
               list.append(row);
             }
           }
@@ -1118,6 +1242,7 @@
       function bubbleFor(entry) {
         const row = document.createElement('div');
         row.className = 'msg' + (entry.role === 'user' ? ' user' : '');
+        row.dataset.collapseKey = collapseKey(entry);
         const isSummary = entry.stage === 'summary';
 
         if (entry.role !== 'user') {
@@ -1144,6 +1269,14 @@
             stage.textContent = STAGE_LABEL[entry.stage] || entry.stage;
             who.append(stage);
           }
+          // 折叠：一轮下来可能五六个模型各写几百字，时间线会被拉得很长。
+          // 收起时留一行开头预览，不至于连"谁说了什么"都看不见。
+          const caret = document.createElement('button');
+          caret.className = 'msg-caret';
+          caret.textContent = '▾';
+          caret.title = '折叠 / 展开';
+          caret.addEventListener('click', () => toggleCollapse(row, caret));
+          who.append(caret);
           main.append(who);
         }
 
@@ -1157,14 +1290,145 @@
           body.classList.add('summary-card');
         }
         main.append(body);
+        // 折叠时露出的那一行预览：光把正文 clip 掉会断在半句话上，
+        // 单独铺一行干净的纯文本更像"他大概说了什么"。
+        // 顺手抹掉 Markdown 记号，否则预览里会露出 ** 和 # 这种渲染后才消失的东西。
+        const preview = document.createElement('div');
+        preview.className = 'msg-preview';
+        preview.textContent = (entry.content || '')
+          .replace(/```[\s\S]*?```/g, ' ')
+          .replace(/[*_`>#|-]/g, '')
+          .replace(/\s+/g, ' ')
+          .trim()
+          .slice(0, 70);
+        if (entry.role !== 'user') {
+          main.append(preview);
+        }
         row.append(main);
+        // 折叠状态按人记，重新打开这场会议时保持原样
+        if (entry.role !== 'user' && collapsedKeys.has(collapseKey(entry))) {
+          row.classList.add('collapsed');
+          const caret = caretFor(row);
+          if (caret) {
+            caret.textContent = '▸';
+          }
+        }
         return row;
+      }
+
+      function caretFor(row) {
+        return row.querySelector('.msg-caret');
+      }
+
+      function collapseKey(entry) {
+        return `${entry.speaker}|${entry.stage}|${entry.round ?? 0}`;
+      }
+
+      /** 折叠状态按「人 + 轮次」记，重新打开这场会议时保持原样。 */
+      const collapsedKeys = new Set();
+
+      function toggleCollapse(row, caret) {
+        const key = row.dataset.collapseKey;
+        const collapsed = row.classList.toggle('collapsed');
+        caret.textContent = collapsed ? '▸' : '▾';
+        if (!key) {
+          return;
+        }
+        if (collapsed) {
+          collapsedKeys.add(key);
+        } else {
+          collapsedKeys.delete(key);
+        }
+      }
+
+      /* ── 边写边显示 ──────────────────────────────────────────
+         Grok 走 WebSocket，帧是一帧一帧到的，所以能真正做到"有字就显示"，
+         不用对着空白等整段写完。其他 provider 的 HTTP 流只能在生成结束后
+         一次性取到 body，推不了增量——但它们至少会先收到 meeting.speaking，
+         所以那个人会**立刻**冒出来写着"正在写…"，不至于让人分不清是在跑还是卡住。
+      ─────────────────────────────────────────────────────── */
+      const liveBubbles = new Map();
+
+      function liveKey(speaker, round) {
+        return `${speaker}#${round}`;
+      }
+
+      /**
+       * 某个人开始写了 —— 气泡**立刻**出现，正文先显示「正在写…」。
+       *
+       * 没有这一步，从"他开始写"到"他写完"这整段时间里屏幕上什么都不变，
+       * 用户分不清是在跑还是卡住了。走 HTTP 的 provider 推不出增量，
+       * 这个占位就是他们唯一的进度反馈。
+       */
+      /**
+       * 本轮容器。实时气泡和最终气泡必须挂在同一个父节点上，否则
+       * "先冒出来的占位"和"后来替换上去的完整发言"会落在时间线的不同位置，
+       * 看起来就像顺序乱了。
+       */
+      function turnContainer() {
+        return state.turnWrap ?? $('transcript');
+      }
+
+      function showSpeaking(speaker, provider, round, stage) {
+        const key = liveKey(speaker, round);
+        if (liveBubbles.has(key)) {
+          return;
+        }
+        $('welcome').hidden = true;
+        const node = bubbleFor({ role: 'assistant', speaker, provider, stage, round, content: '' });
+        node.classList.add('streaming', 'speaking');
+        const body = node.querySelector('.msg-body');
+        body.textContent = '正在写…';
+        turnContainer().append(node);
+        liveBubbles.set(key, node);
+        scrollToEnd();
+      }
+
+      function appendLiveDelta(speaker, provider, round, text, stage) {
+        if (!text) {
+          return;
+        }
+        const key = liveKey(speaker, round);
+        let node = liveBubbles.get(key);
+
+        if (!node) {
+          $('welcome').hidden = true;
+          node = bubbleFor({ role: 'assistant', speaker, provider, stage, round, content: '' });
+          node.classList.add('streaming');
+          turnContainer().append(node);
+          liveBubbles.set(key, node);
+        }
+        // 有真字了就撤掉占位
+        node.classList.remove('speaking');
+        const body = node.querySelector('.msg-body');
+        const base = node.dataset.text || '';
+        const next = base + text;
+        node.dataset.text = next;
+        body.innerHTML = render(next);
+        scrollToEnd();
+      }
+
+      function closeLiveBubble(speaker, round) {
+        const node = liveBubbles.get(liveKey(speaker, round));
+        if (node) {
+          node.classList.remove('streaming');
+          liveBubbles.delete(liveKey(speaker, round));
+        }
+      }
+
+      /** 重新渲染整条时间线时，把残留的流式气泡状态清掉。 */
+      function resetLiveBubbles() {
+        for (const node of liveBubbles.values()) {
+          node.classList.remove('streaming');
+        }
+        liveBubbles.clear();
       }
 
       function renderTranscript(meeting) {
         $('welcome').hidden = true;
         const column = $('transcript');
         column.innerHTML = '';
+        resetLiveBubbles();
         for (const turn of meeting.turns) {
           const wrap = document.createElement('div');
           wrap.className = 'turn';
@@ -1200,6 +1464,7 @@
           $('meetingMeta').textContent = meeting.turns.length
             ? `${meeting.turns.length} 轮 · ${meeting.participants.length} 席位`
             : '';
+          syncUrl();
           await refreshSeatNames();
           renderTranscript(meeting);
           setStatus(
@@ -1207,18 +1472,124 @@
             meeting.turns.length ? '继续提问即可接上之前的发言。' : '写下第一个问题。',
           );
           loadHistory();
+          // 上一轮可能还在服务端跑着（用户中途切走过），把进度接上。
+          attachToRun(meeting.id);
         } catch (error) {
           setStatus('err', String(error.message));
         }
       }
 
+      /** 地址栏带上会议 id，方便分享、刷新、收藏（和 ChatGPT 的 /c/<uuid> 一个意思）。 */
+      function syncUrl() {
+        const path = state.meetingId ? `/meeting/${state.meetingId}` : '/meeting';
+        // 查询串必须一起带上。`?token=` 是链接的一部分，replaceState 顺手抹掉的话，
+        // 复制出去的地址在别的设备上打开就没令牌了——正是分享链接要解决的问题。
+        const url = path + location.search;
+        if (location.pathname + location.search !== url) {
+          history.replaceState(null, '', url);
+        }
+      }
+
+      function meetingIdFromUrl() {
+        const match = location.pathname.match(/^\/meeting\/(meeting-[0-9a-f-]+)$/);
+        return match ? match[1] : null;
+      }
+
+      /**
+       * 接上一场正在后台跑的会议。
+       *
+       * 会议跑在服务端，页面订阅只是"看"。所以中途切去控制台、去看别的会议、
+       * 甚至关掉页面，会议照跑；回来时靠这个轮询把进度和最终结果取回来。
+       */
+      let runTimer = null;
+      async function attachToRun(meetingId) {
+        stopWatchingRun();
+        let seen = 0;
+        for (;;) {
+          let run;
+          try {
+            ({ run } = await api('/meeting/runs/' + meetingId));
+          } catch {
+            return; // 没在跑（或已经跑完落库了），不必再盯
+          }
+          if (!run || run.status !== 'running') {
+            return;
+          }
+
+          for (const entry of run.entries.slice(seen)) {
+            const column = $('transcript');
+            if (!column.querySelector(`[data-run-key="${CSS.escape(runKey(entry))}"]`)) {
+              column.append(bubbleFor(entry));
+            }
+          }
+          seen = run.entries.length;
+          $('welcome').hidden = true;
+          // 谁正在写也要还原出来，否则回来只看到几条已完成的，
+          // 分不清"还没开始"和"有人正卡在生成上"。
+          if (run.speaking) {
+            const key = liveKey(run.speaking.speaker, run.speaking.round);
+            const node = liveBubbles.get(key);
+            if (node) {
+              node.remove();
+              liveBubbles.delete(key);
+            }
+            showSpeaking(
+              run.speaking.speaker,
+              run.speaking.provider,
+              run.speaking.round,
+              run.speaking.round === 0 ? 'summary' : 'discussion',
+            );
+          }
+          scrollToEnd();
+          setStatus(
+            'busy',
+            run.speaking
+              ? `${run.speaking.speaker} 正在写…已收到 ${run.entries.length} 条，可以随意切走。`
+              : `后台运行中…已收到 ${run.entries.length} 条发言，可以随意切走。`,
+          );
+
+          await new Promise((resolve) => setTimeout(resolve, 3000));
+          // 用户中途又切到别的会议就别再盯了
+          if (state.meetingId !== meetingId) {
+            return;
+          }
+        }
+      }
+
+      function runKey(entry) {
+        return `${entry.speaker}-${entry.stage}-${entry.round ?? 0}-${(entry.content || '').slice(
+          0,
+          24,
+        )}`;
+      }
+
+      function stopWatchingRun() {
+        if (runTimer) {
+          clearTimeout(runTimer);
+          runTimer = null;
+        }
+      }
+
+      /** 这场会议库里有没有真的记下轮次。没有就别重画，否则会把现场擦成空白。 */
+      async function hasRecordedTurn(meetingId) {
+        try {
+          const { meeting } = await api('/meetings/' + meetingId);
+          return Array.isArray(meeting?.turns) && meeting.turns.length > 0;
+        } catch {
+          return false;
+        }
+      }
+
       function resetToNew() {
         state.meetingId = null;
+        stopWatchingRun();
+        setSidebar(false);
         state.mode = 'round-robin';
         state.seats = ['chatgpt', 'claude', 'deepseek'].map((provider) => ({ provider }));
         state.summarizer = 'qwen';
         state.summarizerSeat = '';
         state.rounds = 1;
+        syncUrl();
         $('meetingTitle').textContent = '新会议';
         $('meetingMeta').textContent = '';
         $('transcript').innerHTML = '';
@@ -1301,11 +1672,22 @@
         fresh.value = '';
         fresh.textContent = '新会话';
         seatSelect.append(fresh);
-        for (const alias of state.seatAliases) {
+        // **只列总结者自己的席位。** 复用靠的是同名 ⇒ 同 conversationId ⇒ 命中同一个
+        // 浏览器标签页，跨模型压根不成立。原来这里把全部席位都列出来，于是选
+        // 总结者=qwen 时还能勾「复用 chatgpt1」，结果开出来是个挂着 chatgpt 名字的
+        // 全新 qwen 会话，底下那句提示还是在说假话。
+        for (const seat of state.planParticipants) {
+          if (seat.provider !== state.summarizer) {
+            continue;
+          }
           const option = document.createElement('option');
-          option.value = alias;
-          option.textContent = `复用 ${alias}`;
+          option.value = seat.alias;
+          option.textContent = `复用 ${seat.alias}`;
           seatSelect.append(option);
+        }
+        if (!seatSelect.querySelector(`option[value="${state.summarizerSeat}"]`)) {
+          // 原来的选择已经不属于当前总结者了，别留着发出去让服务端报错
+          state.summarizerSeat = '';
         }
         seatSelect.value = state.summarizerSeat;
         $('summarizer').value = state.summarizer;
@@ -1313,6 +1695,9 @@
         $('seatHint').textContent = state.summarizerSeat
           ? `总结会在 ${state.summarizerSeat} 的同一个网页会话里收口，因此它记得自己刚才说了什么。`
           : '总结者每次都用新会话。留空即如此。';
+        $('addSeatBtn').disabled = state.seats.length >= MAX_SEATS;
+        $('addSeatBtn').textContent =
+          state.seats.length >= MAX_SEATS ? `最多 ${MAX_SEATS} 个席位` : '添加参与者';
 
         $('seatsChipText').textContent = `${state.seats.length} 个席位`;
         $('seatsChip').dataset.on = String(state.seats.length > 0);
@@ -1350,6 +1735,7 @@
         pending.className = 'msg pending';
         wrap.append(pending);
         column.append(wrap);
+        state.turnWrap = wrap;
         scrollToEnd();
 
         const template =
@@ -1410,15 +1796,45 @@
               }
               if (event.type === 'meeting.started') {
                 state.meetingId = event.meeting.conversationId;
+                syncUrl();
                 $('meetingMeta').textContent = `${state.seats.length} 席位`;
+              } else if (event.type === 'meeting.speaking') {
+                // 人先冒出来，正文随后填进去
+                pending.remove();
+                showSpeaking(
+                  event.speaker,
+                  event.provider,
+                  event.round,
+                  event.round === 0 ? 'summary' : 'discussion',
+                );
+              } else if (event.type === 'meeting.delta') {
+                // 有字就显示，不等这个人写完。
+                pending.remove();
+                appendLiveDelta(
+                  event.speaker,
+                  event.provider,
+                  event.round,
+                  event.contentDelta,
+                  event.round === 0 ? 'summary' : 'discussion',
+                );
               } else if (event.type === 'meeting.entry' && event.entry) {
                 pending.remove();
-                wrap.append(bubbleFor(event.entry));
+                // 如果这条已经用 delta 逐字显示过了，就地替换成完整气泡，
+                // 不要重复出现两次。
+                const key = liveKey(event.entry.speaker, event.entry.round ?? 0);
+                const existing = liveBubbles.get(key);
+                if (existing) {
+                  liveBubbles.delete(key);
+                  existing.replaceWith(bubbleFor(event.entry));
+                } else {
+                  turnContainer().append(bubbleFor(event.entry));
+                }
                 scrollToEnd();
               } else if (event.type === 'meeting.error') {
                 throw new Error(event.error?.message || '会议出错');
               } else if (event.conversationId) {
                 state.meetingId = event.conversationId;
+                syncUrl();
               } else {
                 summary += event?.choices?.[0]?.delta?.content || '';
               }
@@ -1427,7 +1843,11 @@
           }
 
           pending.remove();
-          if (summary) {
+          // 总结已经通过 meeting.entry 正常进时间线了（和别的发言一样带折叠键）。
+          // 以前这里还会拿末尾的 OpenAI 形状 chunk 单独补一张"统一答复"卡片，
+          // 同一段话显示两遍，所以去掉了。
+          // 万一事件没来（比如中途断流），至少别让总结整段丢掉。
+          if (summary && !liveBubbles.size && !turnContainer().querySelector('.summary-card')) {
             const card = document.createElement('div');
             card.className = 'msg';
             card.innerHTML =
@@ -1435,7 +1855,7 @@
               '<div class="msg-who"><span class="msg-name">统一答复</span>' +
               '<span class="msg-stage">总结</span></div>' +
               `<div class="msg-body summary-card">${render(summary)}</div></div>`;
-            wrap.append(card);
+            turnContainer().append(card);
             scrollToEnd();
           }
           setStatus('ok', '完成。');
@@ -1444,9 +1864,21 @@
           setStatus('err', String(error.message));
         } finally {
           state.busy = false;
+          state.turnWrap = null;
           $('sendBtn').disabled = $('input').value.trim() === '';
+          // 只有当库里真的记下了这一轮才重新渲染。
+          //
+          // 中途出错时这一轮是空的，原来这里无条件 openMeeting，而 openMeeting
+          // 会 `column.innerHTML = ''` 再按记录重画 —— 于是屏幕上刚才还能看到的
+          // 占位和发言**全被擦掉**，表现就是"弹了个错然后一片空白"。
+          // 宁可留着现场，也不要抹掉。
           if (state.meetingId) {
-            openMeeting(state.meetingId);
+            const recorded = await hasRecordedTurn(state.meetingId);
+            if (recorded) {
+              openMeeting(state.meetingId);
+            } else {
+              loadHistory();
+            }
           }
         }
       }
@@ -1464,9 +1896,21 @@
       });
       $('newMeetingBtn').addEventListener('click', resetToNew);
       $('refreshListBtn').addEventListener('click', loadHistory);
-      $('toggleSidebarBtn').addEventListener('click', () => {
+      function setSidebar(open) {
         const sidebar = $('sidebar');
-        sidebar.dataset.open = sidebar.dataset.open === 'true' ? 'false' : 'true';
+        sidebar.dataset.open = String(open);
+        document.body.dataset.sidebar = open ? 'open' : 'closed';
+      }
+
+      $('toggleSidebarBtn').addEventListener('click', () => {
+        setSidebar($('sidebar').dataset.open !== 'true');
+      });
+      $('closeSidebarBtn').addEventListener('click', () => setSidebar(false));
+      // Esc 关浮层，和桌面上的习惯一致
+      document.addEventListener('keydown', (event) => {
+        if (event.key === 'Escape' && $('sidebar').dataset.open === 'true') {
+          setSidebar(false);
+        }
       });
       $('settingsChip').addEventListener('click', () => {
         const panel = $('settings');
@@ -1488,6 +1932,10 @@
         });
       }
       $('addSeatBtn').addEventListener('click', async () => {
+        if (state.seats.length >= MAX_SEATS) {
+          setStatus('err', `席位最多 ${MAX_SEATS} 个。`);
+          return;
+        }
         const used = new Set(state.seats.map((s) => s.provider));
         state.seats.push({ provider: PROVIDERS.find((id) => !used.has(id)) ?? PROVIDERS[0] });
         await refreshSeatNames();
@@ -1546,10 +1994,25 @@
         await refreshSeatNames();
         if (token()) {
           loadHistory();
+          // 地址栏带 id（/meeting/<id>）就直接打开那一场；分享、刷新、收藏都能用
+          const fromUrl = meetingIdFromUrl();
+          if (fromUrl) {
+            openMeeting(fromUrl);
+          }
         } else {
           showTokenGate('尚未提供访问令牌，所有接口都会返回 401。');
         }
       })();
+
+      // 会议跑在服务端，这里离开页面不会打断它。回来时靠 /meeting/runs/:id
+      // 把进度接上，所以切去控制台、去看别的会议记录都不影响。
+      window.addEventListener('beforeunload', (event) => {
+        if (!state.busy) {
+          return;
+        }
+        event.preventDefault();
+        event.returnValue = '';
+      });
     </script>
   </body>
 </html>
