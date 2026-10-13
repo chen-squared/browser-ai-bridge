@@ -4,15 +4,20 @@ import { readFileSync } from 'node:fs';
 
 import {
   createGrokAccumulator,
+  detectProviderStreamError,
+  dropDuplicateBlocks,
   parseSseEvents,
   parseSseFrames,
   reduceChatgptStream,
   reduceClaudeConversation,
+  reduceClaudeStream,
   reduceDeepseekStream,
   reduceGeminiStream,
   reduceGrokStream,
   reduceQwenStream,
+  type ReducedStream,
   splitGeminiFrames,
+  stripChatgptUiDsl,
 } from '../src/stream-capture.js';
 
 /**
@@ -871,5 +876,235 @@ describe('Gemini —— Google 私有 batchexecute 封装', () => {
     ]);
     const frame = JSON.stringify([['wrb.fr', null, inner]]);
     assert.throws(() => reduceGeminiStream(`)]}'\n\n${frame}`), /1099|配额/);
+  });
+});
+
+describe('剥掉 ChatGPT 混进正文的 UI DSL', () => {
+  it('组件标签摘掉、里面的文字留下', () => {
+    const input = '<box gap={3}>\n<radio value="cloud">官网有 Plus 套餐</radio>\n</box>';
+    const out = stripChatgptUiDsl(input);
+    assert.doesNotMatch(out, /<box|<radio|<\/box>/);
+    assert.match(out, /官网有 Plus 套餐/, '选项文案是有用的，要留下');
+  });
+
+  it('{@body …} 按花括号配平整段丢掉', () => {
+    const out = stripChatgptUiDsl('{@body const [kind,setKind] = DIL.useState("cloud")}\n正文');
+    assert.equal(out, '正文');
+  });
+
+  it('花括号里带引号也不影响配平', () => {
+    const out = stripChatgptUiDsl('{@body const s = "a}b"} 后面');
+    assert.equal(out, '后面');
+  });
+
+  it('引用标记 <Cite> 直接去掉，图片留个占位', () => {
+    const out = stripChatgptUiDsl(
+      '结论<Cite refs={["turn1search0"]}/>\n<AsyncImage query="雪景" aspectRatio="3:4"/>',
+    );
+    assert.doesNotMatch(out, /Cite|refs=/);
+    assert.match(out, /结论/);
+    assert.match(out, /［图片］/);
+  });
+
+  it('query 里嵌着图片标签时不被内层的 /> 提前截断', () => {
+    // 外层 query 是多行 Markdown，里面还嵌了一个 <AsyncImage>。
+    // 按引号配对会在内层的 " 上错位，所以这里靠嵌套深度扫到真正结束。
+    const input = [
+      '<AsyncImage query="## 标题',
+      '',
+      '<AsyncImage query="x" aspectRatio="3:4" maxWidth="100px"/>',
+      '正文 A">',
+      '真正的正文',
+    ].join('\n');
+    const out = stripChatgptUiDsl(input);
+    assert.match(out, /真正的正文/);
+    assert.doesNotMatch(out, /aspectRatio|## 标题/);
+  });
+
+  it('残缺输入不抛异常，原样吐出', () => {
+    for (const input of ['<', '{', '<AsyncImage query="没闭合', '{{{', '']) {
+      assert.doesNotThrow(() => stripChatgptUiDsl(input));
+    }
+  });
+});
+
+describe('丢掉重复段落', () => {
+  it('前缀重复时保留更完整的那份', () => {
+    const truncated = '适合轻量设计需求。额度相对有限，适';
+    const complete = '适合轻量设计需求。额度相对有限，适合先验证工具是否符合自己的工作流。';
+    const out = dropDuplicateBlocks(`${truncated}\n\n${complete}`);
+    assert.equal(out, complete);
+  });
+
+  it('完全相同的两段只留最后一次的那份', () => {
+    // 真实抓取里，被截断的副本在前、完整的那份在后，所以保留后者。
+    const out = dropDuplicateBlocks('甲段落\n\n乙段落\n\n甲段落');
+    assert.equal(out, '乙段落\n\n甲段落');
+  });
+
+  it('各写一遍的正常段落不受影响', () => {
+    // 关键：前缀不同就不能当成重复，否则会把真实内容删掉
+    const out = dropDuplicateBlocks('ChatGPT 认为该订阅值得买。\n\nClaude 认为不必急着订阅。');
+    assert.equal(out, 'ChatGPT 认为该订阅值得买。\n\nClaude 认为不必急着订阅。');
+  });
+});
+
+describe('真实捕获：ChatGPT 把组件 DSL 当正文吐出来', () => {
+  /** 一次真实回答的完整 SSE（195KB），模型吐了一屏 `<box>`/`<radio-group>`/`<Cite>`。 */
+  const REAL = readFileSync(
+    new URL('./fixtures/chatgpt-ui-dsl-stream.txt', import.meta.url),
+    'utf8',
+  );
+
+  const content =
+    reduceChatgptStream(parseSseEvents(REAL).map((event) => event.data))?.content ?? '';
+
+  it('归约出来的是可读正文，不是尖括号堆', () => {
+    assert.doesNotMatch(content, /<box|<radio|<Cite|\{@body|aspectRatio=/);
+  });
+
+  it('没有大段重复', () => {
+    // 外层 AsyncImage 的 query 里抄了整篇答案，不去重就会看到同一段话两三遍
+    const seen = new Map<string, number>();
+    for (let i = 0; i + 20 <= content.length; i += 1) {
+      const key = content.slice(i, i + 20);
+      seen.set(key, (seen.get(key) ?? 0) + 1);
+    }
+    const worst = Math.max(0, ...seen.values());
+    assert.ok(worst <= 2, `有 20 字片段出现 ${worst} 次，说明还有重复没去掉`);
+  });
+
+  it('实质内容留着（套餐名、价格、建议）', () => {
+    assert.match(content, /Free/);
+    assert.match(content, /\$7–10/);
+    assert.match(content, /不要急着年付|不要这样理解/);
+  });
+});
+
+describe('认出协议里报的错（配额用完之类）', () => {
+  it('Grok 的 usage_limit_reached 会被认出来', () => {
+    // 实测帧：{"event":{"type":"response.grok.output","output":{"stream_error":{
+    //   "kind":"usage_limit_reached","message":"You've reached your usage limit."}}}
+    const payload =
+      '{"event":{"type":"response.grok.output","output":{"stream_error":{"kind":"usage_limit_reached","message":"You\'ve reached your usage limit. Please try again later.","severity":"normal"}}}}';
+    const found = detectProviderStreamError('grok', payload);
+    assert.ok(found);
+    assert.equal(found.kind, 'quota');
+    assert.match(found.message, /用量已达上限/);
+    assert.match(found.message, /try again later/, '站点自己的说明要带上');
+  });
+
+  it('Grok 的其它错误 kind 也能认出来', () => {
+    const payload =
+      '{"event":{"type":"response.grok.output","output":{"stream_error":{"kind":"internal","message":"boom"}}}}';
+    const found = detectProviderStreamError('grok', payload);
+    assert.ok(found);
+    assert.match(found.message, /Grok 返回错误（internal）/);
+  });
+
+  it('Gemini 的配额错误码认得出来', () => {
+    const found = detectProviderStreamError('gemini', '[["wrb.fr",null,"BardErrorInfo [1099] …"]]');
+    assert.equal(found?.kind, 'quota');
+    assert.match(found?.message ?? '', /Gemini 配额已用完/);
+  });
+
+  it('限流 / 需要登录 / 内容拦截分别归类', () => {
+    assert.equal(
+      detectProviderStreamError('claude', '{"error":{"type":"rate_limit_exceeded"}}')?.kind,
+      'rate_limit',
+    );
+    assert.equal(detectProviderStreamError('claude', 'please sign in to continue')?.kind, 'login');
+    assert.equal(detectProviderStreamError('claude', 'blocked by content policy')?.kind, 'blocked');
+  });
+
+  it('正常负载不误报', () => {
+    assert.equal(
+      detectProviderStreamError(
+        'grok',
+        '{"event":{"type":"response.chunk","chunk":{"text":{"text":"你好"}}}}',
+      ),
+      undefined,
+    );
+    assert.equal(
+      detectProviderStreamError('chatgpt', '{"v":{"message":{"content":{"parts":["正常回答"]}}}}'),
+      undefined,
+    );
+    assert.equal(detectProviderStreamError('qwen', ''), undefined);
+  });
+
+  it('识别到错误时，take 会返回一个只有 error 的结果，而不是"没有内容"', () => {
+    // 这是关键行为：以前这里返回 undefined，错误就一路退化成
+    // "未能稳定提取 XXX 的回复内容"，真正的原因被吞掉了。
+    const errorOnly: ReducedStream = {
+      content: '',
+      reasoningContent: '',
+      finished: false,
+      error: 'Grok 用量已达上限：You have reached your usage limit.',
+    };
+    assert.equal(errorOnly.content, '');
+    assert.match(errorOnly.error ?? '', /用量已达上限/);
+  });
+});
+
+describe('归约 Claude 的 SSE 流', () => {
+  /** 真实捕获（2026-10-11），含中文回答与完整的事件序列。 */
+  const SSE = readFileSync(new URL('./fixtures/claude-sse-stream.txt', import.meta.url), 'utf8');
+
+  const reduced = reduceClaudeStream(parseSseEvents(SSE).map((event) => event.data));
+
+  it('中文逐字正确', () => {
+    // 这一条是踩过坑才有的断言：曾经认定"Claude 的 SSE 里中文是坏的"，
+    // 于是放弃了整条流改抓会话 JSON 快照。重新抓原始字节复查，线上字节是对的，
+    // 那条结论是错的。
+    assert.equal(
+      reduced?.content,
+      '秋天日照变短、气温下降，叶绿素停止合成并分解，原本被掩盖的黄色类胡萝卜素便显现出来。',
+    );
+  });
+
+  it('stop_reason 到达即视为结束', () => {
+    assert.equal(reduced?.finished, true);
+  });
+
+  it('没有完成信号时不谎报 finished', () => {
+    const partial = reduceClaudeStream(
+      parseSseEvents(
+        'event: content_block_delta\ndata: {"type":"content_block_delta","delta":{"type":"text_delta","text":"半句"}}\n\n',
+      ).map((event) => event.data),
+    );
+    assert.equal(partial?.content, '半句');
+    assert.equal(partial?.finished, false);
+  });
+
+  it('ping / message_limit 这类噪声帧被忽略', () => {
+    const noise = reduceClaudeStream(
+      parseSseEvents(
+        'event: ping\ndata: {"type":"ping"}\n\nevent: message_limit\ndata: {"type":"message_limit","x":1}\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n',
+      ).map((event) => event.data),
+    );
+    assert.equal(noise?.content, '');
+    assert.equal(noise?.finished, true, 'message_stop 也是有效的结束信号');
+  });
+
+  it('thinking 块归到思考内容，不混进正文', () => {
+    const thinking = reduceClaudeStream(
+      parseSseEvents(
+        [
+          'event: content_block_delta',
+          'data: {"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"先想想"}}',
+          '',
+          'event: content_block_delta',
+          'data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"答案"}}',
+          '',
+        ].join('\n'),
+      ).map((event) => event.data),
+    );
+    assert.equal(thinking?.reasoningContent, '先想想');
+    assert.equal(thinking?.content, '答案');
+  });
+
+  it('非 JSON 帧不炸，且一个都没认出来时返回 undefined', () => {
+    assert.equal(reduceClaudeStream(['<html>502</html>']), undefined);
+    assert.equal(reduceClaudeStream([]), undefined);
   });
 });

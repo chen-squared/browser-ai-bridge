@@ -29,7 +29,103 @@ export type ReducedStream = {
   conversationId?: string;
   /** 站点是否明确表示这一轮生成结束。比"DOM 连续三轮不变"可靠得多。 */
   finished: boolean;
+  /**
+   * 站点在协议里明确报的错误（配额用完、限流、需要登录…）。
+   *
+   * 没有这个字段时，一次配额耗尽会一路退化成"未能稳定提取回复内容"——
+   * 用户完全看不出是额度问题，只会以为是自己哪里设置错了。
+   */
+  error?: string;
 };
+
+/** 协议里常见的、值得单独告诉用户的失败原因。 */
+export type StreamFailureKind = 'quota' | 'rate_limit' | 'login' | 'blocked' | 'unknown';
+
+/**
+ * 从原始负载里认出"这一轮失败是因为什么"。
+ *
+ * 站点在协议里报错时往往**不给正文**，只给一个错误事件。原来这条路的结果是
+ * 归约出 0 个字，然后报一句"未能稳定提取 XXX 的回复内容"——把真正的原因
+ * （例如 Grok 的 `usage_limit_reached`）整个吞掉。
+ *
+ * 顺序有意在前面：配额和限流是最常见、也最值得明确告诉用户的两类。
+ */
+export function detectProviderStreamError(
+  provider: string,
+  payload: string,
+): { kind: StreamFailureKind; message: string } | undefined {
+  if (!payload) {
+    return undefined;
+  }
+
+  // Grok：response.grok.output → stream_error（kind + 自带的 message）
+  if (provider === 'grok' && /"stream_error"/.test(payload)) {
+    const kind = /"kind"\s*:\s*"([^"]+)"/.exec(payload)?.[1] ?? '';
+    const message = /"message"\s*:\s*"([^"]+)"/.exec(payload)?.[1];
+    const label =
+      kind === 'usage_limit_reached'
+        ? 'Grok 用量已达上限'
+        : kind
+          ? `Grok 返回错误（${kind}）`
+          : 'Grok 返回错误';
+    return { kind: classify(label), message: `${label}${message ? `：${message}` : ''}` };
+  }
+
+  // Gemini：额度/配额用完时会给一个错误码
+  if (provider === 'gemini' && /BardErrorInfo\s*\[1099\]/.test(payload)) {
+    return {
+      kind: 'quota',
+      message: 'Gemini 配额已用完（BardErrorInfo 1099），换个时间或账号再试',
+    };
+  }
+
+  // 通用信号：各家措辞不同，但关键词是共通的
+  const rules: Array<{ re: RegExp; kind: StreamFailureKind; label: string }> = [
+    {
+      re: /usage_limit_reached|You've reached your usage limit|quota_exceeded|out of credits/i,
+      kind: 'quota',
+      label: '用量已达上限',
+    },
+    {
+      re: /\brate[_ -]?limit|\b429\b|too many requests/i,
+      kind: 'rate_limit',
+      label: '触发了限流',
+    },
+    {
+      re: /login[_ -]?required|please (sign|log) ?in|需要登录|未登录/i,
+      kind: 'login',
+      label: '需要登录',
+    },
+    {
+      re: /content[_ -]?(policy|filter)|blocked by|safety|敏感内容/i,
+      kind: 'blocked',
+      label: '内容被安全策略拦截',
+    },
+  ];
+
+  for (const rule of rules) {
+    if (rule.re.test(payload)) {
+      return { kind: rule.kind, message: `${provider} ${rule.label}` };
+    }
+  }
+  return undefined;
+}
+
+function classify(label: string): StreamFailureKind {
+  if (/上限|配额|quota/i.test(label)) {
+    return 'quota';
+  }
+  if (/限流|rate/i.test(label)) {
+    return 'rate_limit';
+  }
+  if (/登录|login/i.test(label)) {
+    return 'login';
+  }
+  if (/拦截|blocked/i.test(label)) {
+    return 'blocked';
+  }
+  return 'unknown';
+}
 
 /**
  * 从完整的 SSE 响应体里取出各个 `data:` 负载。
@@ -672,6 +768,233 @@ export type SseEvent = {
  *      之后正文靠 `/message/content/parts/0` 的 `append` 累积。
  *      所以**只认最后一条 assistant message**，并且要用补丁重建它，不能拼接所有 append。
  */
+/**
+ * 剥掉 ChatGPT 吐出来的内部 UI DSL。
+ *
+ * ChatGPT 有时候把渲染用的组件标记一起写进正文：`<Cite>`、`<box>`、`<radio-group>`、
+ * `{@body const [kind,setKind] = ...}` 这些都不是 Markdown，原样透出去就是一屏
+ * 尖括号和花括号。
+ *
+ * 最麻烦的是 `<AsyncImage query="…"/>`：query 是模型自己写的图描述，**里面常常带
+ * 引号、换行，而且会把整篇答案又抄一遍当提示词**。于是同一段话在正文里出现两次，
+ * 读起来就是"乱、重复"。所以不能按"扫到 />"截断，必须跟踪引号状态。
+ *
+ * 组件里的文字（`<radio>` 的选项文案之类）是有用的，所以只摘标签、留文字。
+ */
+export function stripChatgptUiDsl(text: string): string {
+  if (!text || !/[<{]/.test(text)) {
+    return text;
+  }
+
+  let out = '';
+  let index = 0;
+  // 自闭合、整块丢掉（AsyncImage 留个占位，Cite 是引用标记直接不要）
+  const dropWhole = new Set(['AsyncImage', 'Cite', 'img', 'br', 'hr']);
+
+  while (index < text.length) {
+    const angle = text.indexOf('<', index);
+    const brace = text.indexOf('{', index);
+    if (angle === -1 && brace === -1) {
+      out += text.slice(index);
+      break;
+    }
+    const at = angle === -1 ? brace : brace === -1 ? angle : Math.min(angle, brace);
+    out += text.slice(index, at);
+
+    if (at === brace) {
+      const end = matchingBrace(text, at);
+      if (end > at) {
+        index = end + 1;
+        continue;
+      }
+      out += text[at];
+      index = at + 1;
+      continue;
+    }
+
+    const tagEnd = findTagEnd(text, at);
+    if (tagEnd === -1) {
+      out += text.slice(at);
+      break;
+    }
+    const name = /^([A-Za-z][\w.-]*)/.exec(text.slice(at + 1, tagEnd))?.[1] ?? '';
+    if (name === 'AsyncImage') {
+      // 特殊处理：见下面 scanAsyncImageEnd 的注释。
+      const end = scanAsyncImageEnd(text, at);
+      if (end > at) {
+        out += '［图片］';
+        index = end;
+        continue;
+      }
+    }
+    if (name && dropWhole.has(name)) {
+      out += name === 'Cite' ? '' : '\n';
+      index = tagEnd + 1;
+      continue;
+    }
+    // 普通成对标签：只摘标签，留里面的文字
+    index = tagEnd + 1;
+  }
+
+  return (
+    out
+      // 剥标签时漏出来的孤儿属性尾巴（例如 `aspectRatio="3:4" maxWidth="100px"/>`）。
+      // 只认组件常见的那些属性名——正文里出现的 `foo="bar"`（代码片段之类）不能动。
+      .replace(ORPHAN_ATTR, ' ')
+      // 模型偶尔把交互组件的函数调用当正文写出来，形如
+      // `GenUI.issueNewTurn("……"+([purpose])+"…")`。这是内部 DSL，不是给人看的。
+      .replace(/\bGenUI\.[A-Za-z]+\((?:[^()]|\([^()]*\))*\)/g, ' ')
+      .replace(/\n{3,}/g, '\n\n')
+      .replace(/[ \t]{2,}/g, ' ')
+      .trim()
+  );
+}
+
+/** ChatGPT 组件 DSL 里常见的属性名，用来清掉剥标签后残留的 `xxx="…"`。 */
+const ORPHAN_ATTR = new RegExp(
+  [
+    '\\s*(?:aspectRatio|maxWidth|maxHeight|width|height|color|radius|padding|margin|gap|flex',
+    'align|direction|value|refs|query|border|weight|size|tone|variant|href|src|alt|style',
+    'className|onChange|onClick|stroke|fill|rows|cols|opacity|index|id)\\s*=\\s*"[^"]*"\\s*\\/?>?',
+  ].join('|'),
+  'g',
+);
+
+/**
+ * 丢掉重复的段落，保留最完整的那一份。
+ *
+ * 只在 ChatGPT 归约结果上用：它偶尔把整篇答案塞进一个格式坏掉的图片标签里，
+ * 于是同一段话在正文里出现两遍，第二遍还可能被标签截断（`…额度相对有限，适=/>`）。
+ * 这种重复靠"标签配对"是解不开的——外层标签本身就没闭合。
+ *
+ * 判据很保守：只有当某段是另一段的**前缀或完全相同**时才删，并且永远保留长的
+ * 那份。真正各写一遍的正常段落（前缀不一样）不受影响。
+ */
+export function dropDuplicateBlocks(text: string): string {
+  const blocks = text
+    .split(/\n\s*\n/)
+    .map((block) => block.trim())
+    .filter(Boolean);
+  if (blocks.length < 2) {
+    return text;
+  }
+
+  const kept = blocks.filter((block, index) => {
+    return !blocks.some((other, otherIndex) => {
+      if (otherIndex === index) {
+        return false;
+      }
+      // 更长的那段以它开头 → 这段是被截断的副本
+      if (other.length > block.length && other.startsWith(block)) {
+        return true;
+      }
+      // 完全一样时只留最后一次出现的那份
+      return otherIndex > index && other === block;
+    });
+  });
+
+  return kept.length === blocks.length ? text : kept.join('\n\n');
+}
+
+/**
+ * 找 `<AsyncImage …/>` 真正结束的位置。
+ *
+ * 这个标签没法用常规办法截：模型有时会把 query 写成一段**多行 Markdown**，
+ * 而那段内容里往往又嵌着一整个 `<AsyncImage>`（真实抓取到的就是如此——
+ * 外层的 query 里把整篇答案又抄了一遍，还带着嵌套的图片标签）。
+ *
+ * 按引号配对必然错位：外层 `query="` 会在内层那个 `"` 上提前闭合。
+ * 所以改成数嵌套深度：每遇到一个 `<AsyncImage` 加一，每遇到一个 `/>` 减一，
+ * 回到 0 就是外层真正的结束。顺手把 query 里那份**重复的正文整段丢掉**，
+ * 正文只留一份。
+ */
+function scanAsyncImageEnd(text: string, start: number): number {
+  const openTag = /<AsyncImage\b/g;
+  const closeTag = /\/>/g;
+  let depth = 0;
+  let cursor = start;
+  while (cursor < text.length) {
+    openTag.lastIndex = cursor;
+    closeTag.lastIndex = cursor;
+    const nextOpen = openTag.exec(text);
+    const nextClose = closeTag.exec(text);
+    if (!nextClose) {
+      return -1;
+    }
+    if (nextOpen && nextOpen.index < nextClose.index) {
+      depth += 1;
+      cursor = nextOpen.index + 1;
+      continue;
+    }
+    depth -= 1;
+    if (depth === 0) {
+      return nextClose.index + 2;
+    }
+    cursor = nextClose.index + 2;
+  }
+  return -1;
+}
+
+/**
+ * 找标签真正的结束位置。
+ *
+ * 属性值里可能有引号（`query="…"`），所以遇到引号要先跳到引号闭合为止，
+ * 否则会在引号内部那个 `>` 上误判成标签结束——那正好就是"整篇答案被吞进
+ * query 属性"的成因。
+ */
+function findTagEnd(text: string, start: number): number {
+  let quote: string | null = null;
+  for (let i = start + 1; i < text.length; i += 1) {
+    const ch = text[i];
+    if (quote) {
+      if (ch === '\\') {
+        i += 1;
+      } else if (ch === quote) {
+        quote = null;
+      }
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+      continue;
+    }
+    if (ch === '>') {
+      return i;
+    }
+  }
+  return -1;
+}
+
+/** 从 `{` 开始找配平的 `}`，跳过字符串字面量里的括号。 */
+function matchingBrace(text: string, start: number): number {
+  let depth = 0;
+  let quote: string | null = null;
+  for (let i = start; i < text.length; i += 1) {
+    const ch = text[i];
+    if (quote) {
+      if (ch === '\\') {
+        i += 1;
+      } else if (ch === quote) {
+        quote = null;
+      }
+      continue;
+    }
+    if (ch === '"' || ch === "'" || ch === '`') {
+      quote = ch;
+      continue;
+    }
+    if (ch === '{') {
+      depth += 1;
+    } else if (ch === '}') {
+      depth -= 1;
+      if (depth === 0) {
+        return i;
+      }
+    }
+  }
+  return -1;
+}
+
 export function reduceChatgptStream(frames: readonly string[]): ReducedStream | undefined {
   type Message = {
     role?: string;
@@ -870,7 +1193,10 @@ export function reduceChatgptStream(frames: readonly string[]): ReducedStream | 
 
   const index = lastIndex('assistant');
   const answer = index >= 0 ? messages[index] : undefined;
-  const content = (answer?.parts[0] ?? '').trim();
+  // 剥掉 ChatGPT 混进正文的组件标记（<Cite>、<box>、{@body …}、<AsyncImage> 等等）。
+  // 不剥的话，用户看到的就是一屏尖括号；遇到 AsyncImage 的 query 把整篇答案又
+  // 抄一遍时，还会以为文本重复了，所以再按块去一次重。
+  const content = dropDuplicateBlocks(stripChatgptUiDsl(answer?.parts[0] ?? ''));
   const reasoningContent = (answer?.reasoning ?? []).join('\n');
 
   if (!content && !reasoningContent && !finished) {
@@ -907,6 +1233,87 @@ export function reduceChatgptStream(frames: readonly string[]): ReducedStream | 
  * （可能带 `signature`）。因为 JSON 是完整快照，不需要任何归约——直接取最后一条
  * assistant 消息即可，这也是它比流式归约更可靠的地方。
  */
+/**
+ * 归约 Claude 的 SSE 流。
+ *
+ * 形态（2026-10-11 实测 `POST /api/organizations/{org}/chat_conversations/{id}/completion`）：
+ *   event: ping                    data: {"type":"ping"}
+ *   event: conversation_ready      data: {"type":"conversation_ready"}
+ *   event: message_start           data: {"type":"message_start","message":{…}}
+ *   event: content_block_start     data: {"type":"content_block_start","index":0,
+ *                                        "content_block":{"type":"text","text":""}}
+ *   event: content_block_delta     data: {"type":"content_block_delta","index":0,
+ *                                        "delta":{"type":"text_delta","text":"秋天日"}}
+ *   event: content_block_stop      data: {"type":"content_block_stop","index":0}
+ *   event: message_delta           data: {"type":"message_delta",
+ *                                        "delta":{"stop_reason":"end_turn",…}}
+ *   event: message_limit           data: {"type":"message_limit",…}
+ *   event: message_stop            data: {"type":"message_stop"}
+ *
+ * **这里要更正一个早先的错误结论。** 之前记录说「Claude 的 SSE 里中文是坏的，
+ * 静 变成 é<U+009D>™，是 UTF-8 被按 CP1252 误解码」，并因此放弃了整条流、改抓会话
+ * JSON 快照。重新抓原始字节复查后确认：线上字节**完全正确**（`秋天日` / `照变` /
+ * `短、气温下降，` 逐字无误），响应也没有 gzip。也就是说那份乱码不是线路上的问题，
+ * 拿这份流直接归约就能得到逐字正确的中文。
+ *
+ * 所以 Claude 并不是拿不到真流，只是缺一个归约器 + 增量捕获。
+ */
+export function reduceClaudeStream(frames: readonly string[]): ReducedStream | undefined {
+  let content = '';
+  let reasoningContent = '';
+  let finished = false;
+  let sawFrame = false;
+
+  for (const frame of frames) {
+    let parsed: Record<string, unknown>;
+    try {
+      parsed = JSON.parse(frame) as Record<string, unknown>;
+    } catch {
+      continue;
+    }
+    if (!parsed || typeof parsed !== 'object' || typeof parsed['type'] !== 'string') {
+      continue;
+    }
+    sawFrame = true;
+
+    const type = parsed['type'];
+
+    if (type === 'content_block_delta') {
+      const delta = parsed['delta'] as
+        | { type?: string; text?: string; thinking?: string }
+        | undefined;
+      if (delta?.type === 'text_delta' && typeof delta.text === 'string') {
+        content += delta.text;
+      } else if (delta?.type === 'thinking_delta' && typeof delta.thinking === 'string') {
+        reasoningContent += delta.thinking;
+      }
+      continue;
+    }
+
+    // 结束信号有两个，任一到达即可：stop_reason 是权威的那个，
+    // message_stop 是兜底（实测 stop_reason 先到，message_stop 紧跟其后）。
+    if (type === 'message_delta') {
+      const delta = parsed['delta'] as { stop_reason?: string | null } | undefined;
+      if (delta?.stop_reason) {
+        finished = true;
+      }
+      continue;
+    }
+
+    if (type === 'message_stop') {
+      finished = true;
+    }
+  }
+
+  if (!sawFrame) {
+    return undefined;
+  }
+
+  // 实测这条流里没有 usage（message_start 只有元数据，message_delta 只有 stop_reason），
+  // 所以不猜 token 数——编出来的数字比没有更糟。
+  return { content, reasoningContent, finished };
+}
+
 export function reduceClaudeConversation(body: string): ReducedStream | undefined {
   if (!body) {
     return undefined;

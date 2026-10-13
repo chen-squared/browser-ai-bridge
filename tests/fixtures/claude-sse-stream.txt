@@ -1,0 +1,75 @@
+event: ping
+data: {"type":"ping"     }
+
+event: ping
+data: {"type":"ping"             }
+
+event: ping
+data: {"type":"ping"       }
+
+event: ping
+data: {"type":"ping"      }
+
+event: ping
+data: {"type":"ping"    }
+
+event: ping
+data: {"type":"ping"              }
+
+event: conversation_ready
+data: {"type":"conversation_ready"              }
+
+event: message_start
+data: {"type":"message_start","message":{"id":"chatcompl_011Cfv1WAuwabmyQjwsHQHcv","type":"message","role":"assistant","model":"claude-sonnet-5-5","parent_uuid":"01a129bc-ea61-7506-bdde-9349aeaaeae1","uuid":"01a129bc-ea61-7e44-bed1-0ed1207403ea","content":[],"stop_reason":null,"stop_sequence":null,"stop_details":null,"trace_id":"48aa08b7cb77613143a4604e32d71d71","request_id":"req_011Cfv1W5Qo5RLcKE7Lb9Xr7"},"discarded_parent_message_uuid":null }
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":"","citations":[],"start_timestamp":"2026-10-11T06:53:31.120082281Z","stop_timestamp":null,"flags":null}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"秋天日"}    }
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"照变"}         }
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"短、气温下降，"}     }
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"叶绿素停"}               }
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"止合"}              }
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"成并分解，"}    }
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"原"}        }
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"本被"}          }
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"掩盖的黄色"}      }
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"类"}   }
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"胡萝卜素便"}    }
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"显现出来。"}  }
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0,"stop_timestamp":"2026-10-11T06:53:31.854620264Z"           }
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null,"stop_details":null}   }
+
+event: message_limit
+data: {"type":"message_limit","message_limit":{"type":"within_limit","resetsAt":null,"remaining":null,"perModelLimit":null,"representativeClaim":"five_hour","overageDisabledReason":"overage_not_provisioned","overageInUse":false,"windows":{"5h":{"status":"within_limit","resets_at":1791719400,"utilization":0.02},"7d":{"status":"within_limit","resets_at":1792224000,"utilization":0.01}},"resolved":{"status":"ok","limit":{"kind":"session","group":"session","percent":2,"severity":"normal","resets_at":"2026-10-11T11:50:00+00:00","scope":null,"is_active":true},"spend":null,"disabled_reason":"overage_not_provisioned","notice":null}}   }
+
+event: message_stop
+data: {"type":"message_stop"         }
+
