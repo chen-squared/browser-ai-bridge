@@ -50,6 +50,14 @@ export type ProviderConfig = {
    */
   streamCapture?: {
     /**
+     * 是否启用**页内 hook**取流：在页面里 `Response.body.getReader()`（或轮询 XHR 的
+     * `responseText`）逐块读，拿到真正的首字延迟。
+     *
+     * 逐家实测（2026-10-12，`.sessions/hookprobe.mjs`）六家全部可行，见
+     * `browser/inpage-hook.ts` 顶部的对照表。目前只对端到端验证通过的 provider 打开。
+     */
+    inPageCapture?: boolean;
+    /**
      * 只捕获 URL 匹配此模式的响应。
      * `websocket` 传输下匹配的是 `wss://` 地址。
      */

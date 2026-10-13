@@ -1,11 +1,6 @@
-import {
-  chromium,
-  type BrowserContext,
-  type CDPSession,
-  type Locator,
-  type Page,
-} from 'playwright';
+import { chromium, type BrowserContext, type Locator, type Page } from 'playwright';
 import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { IN_PAGE_HOOK_SHIM, inPageStreamHook, STREAM_PUSH_BINDING } from './inpage-hook.js';
 import path from 'node:path';
 import { appConfig } from '../config.js';
 import { getProvider } from '../providers/registry.js';
@@ -16,10 +11,12 @@ import {
   selectSessionsToEvict,
 } from '../conversation-identity.js';
 import {
+  detectProviderStreamError,
   parseSseEvents,
   parseSseFrames,
   reduceChatgptStream,
   reduceClaudeConversation,
+  reduceClaudeStream,
   reduceDeepseekStream,
   reduceGeminiStream,
   reduceGrokStream,
@@ -32,6 +29,16 @@ type CapturedStream = {
   url: string;
   text: string;
   capturedAt: number;
+  /** 当前这条流自己的标识，用来把并发同端点的多条流区分开。 */
+  token?: string;
+  /**
+   * 站点这一条流是不是已经收尾（fetch 的 body 读到 eof / XHR 走到 DONE）。
+   *
+   * 页内 hook 靠它区分"还在陆续来数据"和"已经结束了"：ChatGPT 的 SSE 实测
+   * **永远等不到 eof**，所以不能只靠收尾信号判完成；但收尾信号真到了就可以
+   * 停止轮询，不必干等。
+   */
+  closed?: boolean;
 };
 
 /** WebSocket 捕获到的单帧。逐帧记录是为了保留时间信息——这是 TTFT 的前提。 */
@@ -44,8 +51,6 @@ type CapturedFrame = {
 /** 闲置超过此时长的标签页会被回收。 */
 const SESSION_IDLE_EVICT_MS = 2 * 60 * 60 * 1000;
 
-/** 增量捕获的单次响应最多读多少块。64KB 一块，几百块足够覆盖任何正常回答。 */
-const INCREMENTAL_STREAM_MAX_READS = 500;
 /**
  * 每个 provider 最多保留多少个标签页。
  *
@@ -104,6 +109,9 @@ export class BrowserManager {
    * 检测这层观察。这是"读真流"里风险最低的一种做法。
    */
   private capturedStreams = new WeakMap<Page, CapturedStream[]>();
+
+  /** 已经装过页内 hook 的页面。装两次会套娃，数据会重复。 */
+  private inPageHookPages = new WeakSet<Page>();
   /**
    * WebSocket 捕获到的帧。
    *
@@ -130,6 +138,14 @@ export class BrowserManager {
         '--disable-blink-features=AutomationControlled',
         '--no-first-run',
         '--no-default-browser-check',
+        // 多个 provider 并发时，同一个浏览器里只有一个标签页在前台，Chrome 会把
+        // 后台标签页降频（定时器、渲染、合成全部打折）。后果是"谁和 ChatGPT 一起
+        // 并发谁垮"：Claude 退回 DOM 抓到首屏问候语，Gemini 直接
+        // `locator.focus: Timeout 30000ms`。这三个开关把降频关掉。
+        '--disable-background-timer-throttling',
+        '--disable-backgrounding-occluded-windows',
+        '--disable-renderer-backgrounding',
+        '--disable-features=CalculateNativeWinOcclusion',
       ],
     };
 
@@ -262,7 +278,7 @@ export class BrowserManager {
     sessionKey: string,
   ): Promise<SessionEntry> {
     const provider = getProvider(providerId);
-    const page = await this.createBackgroundPage().catch(() => this.context!.newPage());
+    const page = await this.createBackgroundPage(providerId).catch(() => this.context!.newPage());
     this.ensureStreamListener(page, providerId);
 
     // 导航目标分三种，优先级从高到低：
@@ -376,15 +392,6 @@ export class BrowserManager {
     const recorded = this.capturedStreams.get(page) ?? [];
     this.capturedStreams.set(page, recorded);
 
-    if (provider.streamCapture.endpointGlob) {
-      void this.attachIncrementalStreamCapture(
-        page,
-        provider.streamCapture.endpointGlob,
-        pattern,
-        recorded,
-      );
-    }
-
     page.on('response', (response) => {
       if (!pattern.test(response.url())) {
         return;
@@ -410,81 +417,135 @@ export class BrowserManager {
   }
 
   /**
-   * 增量捕获：不等响应结束，边下边把正文取回来。
+   * 页内流捕获：hook 住 fetch / XHR，把回答响应逐块递出来。
    *
-   * 为什么需要这条：站点把 SSE 一直挂着不关闭时，`response.finished()` 永远不
-   * resolve，`response.body()` 会直接抛 `Network.getResponseBody: No data found`。
-   * ChatGPT 2026-10 就是这样——答案 15 秒就出来了，连接还挂着，真流整条丢失。
-   * 走 CDP `Fetch` 域可以逐块读，不用等它收尾。
+   * **必须在建页时装**，不能等到 `ensureStreamListener`：
+   * `addInitScript` 只对**之后**的导航生效，而那时页面早就打开在站点上了；
+   * 而用 `evaluate` 补注入会卡住——页面可能正在导航，Playwright 的 evaluate 会等
+   * 它就绪。建页时还是 `about:blank`，两个 API 都是稳的。
    *
-   * 两个必须记住的坑：
-   *   1. **先** `takeResponseBodyAsStream` **再** `continueResponse`。反过来
-   *      拦截号立刻失效（`Invalid InterceptionId`）。
-   *   2. 任何分支都必须把请求放行，否则页面会卡在那个响应上不动。
+   * 只装在这一家的页面上，**绝不按 context 装**——六个 provider 共用一个持久
+   * profile，按 context 装的话 hook 抛一个异常，六个站的登录会一起坏。
+   *
+   * 逐块的实测数据见 `inpage-hook.ts` 顶部的表：六家全部可行，
+   * fetch 三家首块 +1~4ms，XHR 两家同样逐块。
    */
-  private async attachIncrementalStreamCapture(
-    page: Page,
-    endpointGlob: string,
-    pattern: RegExp,
-    recorded: CapturedStream[],
-  ): Promise<void> {
-    let cdp: CDPSession;
+  private async installInPageHook(page: Page, providerId: ProviderId): Promise<void> {
+    const provider = getProvider(providerId);
+    if (!provider.streamCapture?.inPageCapture) {
+      // 只有显式开了 inPageCapture 的 provider 才装。WebSocket 走 Playwright 自带的
+      // page.on('websocket')，本来就是真帧流，不需要这里。
+      return;
+    }
+    const pattern = new RegExp(provider.streamCapture.endpointPattern);
+    const hookOptions = { patterns: [pattern.source], binding: STREAM_PUSH_BINDING };
+
+    await page.exposeBinding(STREAM_PUSH_BINDING, (source, payload: string) => {
+      this.ingestInPageFrame(source.page, payload);
+    });
+    // 顺序要紧：shim 先注册，先跑。见 IN_PAGE_HOOK_SHIM 的注释。
+    await page.addInitScript({ content: IN_PAGE_HOOK_SHIM });
+    await page.addInitScript(inPageStreamHook, hookOptions);
+  }
+
+  /**
+   * 把页内递过来的一条消息并进该页的捕获列表。
+   *
+   * 页内 hook 是**边收边登记**的：`open` 时就把空条目 push 进去，之后的 `data`
+   * 往同一条上原地追加。这样 `takeCapturedStream` 每轮轮询都能看到比上一轮更长的
+   * 正文，下层据此算出差量推给调用方。
+   */
+  private ingestInPageFrame(page: Page, payload: string): void {
+    let message: {
+      url?: string;
+      kind?: 'open' | 'data' | 'close' | 'skip' | 'error' | 'ready' | 'trace' | 'note';
+      at?: number;
+      text?: string;
+      tail?: string;
+      message?: string;
+      note?: string;
+      token?: string;
+      /** true = 这是整份快照，Node 侧要替换而不是追加。 */
+      full?: boolean;
+    };
     try {
-      cdp = await page.context().newCDPSession(page);
-      await cdp.send('Fetch.enable', {
-        patterns: [{ urlPattern: endpointGlob, requestStage: 'Response' }],
-      });
+      message = JSON.parse(payload) as typeof message;
     } catch {
-      // 这条路走不通不影响功能：上层照旧退回 response + DOM。
+      return;
+    }
+    if (!message.url || !message.kind) {
       return;
     }
 
-    cdp.on('Fetch.requestPaused', (event) => {
-      void (async () => {
-        if (!pattern.test(event.request.url)) {
-          await cdp
-            .send('Fetch.continueResponse', { requestId: event.requestId })
-            .catch(() => undefined);
+    const recorded = this.capturedStreams.get(page) ?? [];
+    this.capturedStreams.set(page, recorded);
+
+    const open = (): CapturedStream => {
+      const entry: CapturedStream = {
+        url: message.url as string,
+        text: '',
+        capturedAt: message.at ?? Date.now(),
+      };
+      recorded.push(entry);
+      return entry;
+    };
+    // ready：hook 装好了，等第一条请求。不用往下走。
+    if (message.kind === 'ready') {
+      return;
+    }
+
+    if (message.kind === 'open') {
+      // 同一个端点只保留一条：站点并发开多个请求时（Gemini 实测首条中途失败后
+      // 又开一条），新的一条应该**重置**那一条，而不是另起一条——否则两个条目的
+      // 增量会被上层混着归约，正文里凭空多出一截（实测过"秋天…大幅变秋天…"）。
+      for (const entry of recorded) {
+        if (entry.url === message.url) {
+          entry.text = '';
+          entry.closed = false;
+          entry.capturedAt = message.at ?? Date.now();
+          entry.token = message.token;
           return;
         }
+      }
+      const created = open();
+      created.token = message.token;
+      return;
+    }
 
-        // 时间基准同样是**响应开始**的时刻，理由见上面 page.on('response') 那段注释。
-        const startedAt = Date.now();
-        try {
-          const { stream } = await cdp.send('Fetch.takeResponseBodyAsStream', {
-            requestId: event.requestId,
-          });
-          // 放行与读流并行：页面要拿到数据，我们也要拿到正文。
-          void cdp
-            .send('Fetch.continueResponse', { requestId: event.requestId })
-            .catch(() => undefined);
-
-          // 先占位、边读边往里写，而不是读完再 push：上层只等一个窗口，
-          // 等读完再登记的话，这一轮可能已经超时退回 DOM 了。同一对象原地更新，
-          // 所以数组里不会堆积半成品条目。
-          const entry: CapturedStream = { url: event.request.url, text: '', capturedAt: startedAt };
-          recorded.push(entry);
-
-          for (let read = 0; read < INCREMENTAL_STREAM_MAX_READS; read += 1) {
-            const chunk = await cdp.send('IO.read', { handle: stream, size: 64 * 1024 });
-            if (chunk.data) {
-              entry.text += chunk.base64Encoded
-                ? Buffer.from(chunk.data, 'base64').toString('utf8')
-                : chunk.data;
-            }
-            if (chunk.eof) {
-              break;
-            }
-          }
-          await cdp.send('IO.close', { handle: stream }).catch(() => undefined);
-        } catch {
-          // 取流失败也要放行，否则页面永远等不到这个响应。
-          await cdp
-            .send('Fetch.continueResponse', { requestId: event.requestId })
-            .catch(() => undefined);
+    // 只认 token 对得上的那条。token 不一致说明这是另一条并发流的数据，
+    // 收进来就会和当前那条的增量混在一起。
+    for (let i = recorded.length - 1; i >= 0; i -= 1) {
+      const entry = recorded[i];
+      if (entry.url !== message.url || entry.closed) {
+        continue;
+      }
+      if (message.token && entry.token && message.token !== entry.token) {
+        continue;
+      }
+      if (message.kind === 'data') {
+        if (message.full) {
+          entry.text = message.text ?? '';
+        } else {
+          entry.text += message.text ?? '';
         }
-      })();
-    });
+      } else if (message.kind === 'close') {
+        // eof 时流式解码器可能还扣着最后几个字节没吐（不完整的字符）。
+        entry.text += message.tail ?? '';
+        entry.closed = true;
+      } else if (message.kind === 'skip' || message.kind === 'error') {
+        entry.closed = true;
+        console.warn(`[inpage] ${message.kind}: ${String(message.message ?? '').slice(0, 120)}`);
+      }
+      return;
+    }
+
+    // 没有对应的 open（页面在装好 hook 之前就发过请求）：补一条，别把数据丢了。
+    if (message.kind === 'data') {
+      const entry = open();
+      entry.text = message.text ?? '';
+      entry.capturedAt = message.at ?? Date.now();
+      entry.token = message.token;
+    }
   }
 
   /**
@@ -492,6 +553,27 @@ export class BrowserManager {
    *
    * `since` 是发送开始的时间戳：只认这之后捕获的响应，避免把上一轮的流算进来。
    */
+  /**
+   * 这一轮的回答流是不是已经在传输层收尾了。
+   *
+   * **不能拿归约器的 `finished` 当完成信号。** Gemini / Claude 的归约器是无条件
+   * 返回 `finished: true` 的——它们的语义是"从快照里取最后一份完整答案"，
+   * 在整包 body（CDP / response.body()）下成立，但在逐块下推时，第一份能解析出
+   * 字的中间快照就会把 `finished` 置真，于是刚出两个字就收工了
+   * （实测 Gemini 返回过「秋秋」）。
+   *
+   * 页内 hook 知道真正的收尾时刻：fetch 的 body 读到 eof、XHR 走到 readyState=4。
+   * 那个信号才是权威的。
+   */
+  isStreamSettled(page: Page, providerId: ProviderId, since: number): boolean {
+    const provider = getProvider(providerId);
+    if (!provider.streamCapture?.inPageCapture) {
+      return false;
+    }
+    const fresh = (this.capturedStreams.get(page) ?? []).filter((item) => item.capturedAt >= since);
+    return fresh.length > 0 && fresh.every((item) => item.closed === true);
+  }
+
   takeCapturedStream(page: Page, providerId: ProviderId, since: number): ReducedStream | undefined {
     const provider = getProvider(providerId);
     if (!provider.streamCapture) {
@@ -505,27 +587,58 @@ export class BrowserManager {
 
     const reducer = provider.streamCapture.reducer;
 
+    // 从后往前取：优先用最近这一轮。
+    matched.reverse();
+
     if (provider.streamCapture.transport === 'websocket') {
       // WebSocket 帧不是 SSE，没有 data: 前缀，每一帧本身就是一份负载。
-      const frames = (this.capturedFrames.get(page) ?? [])
-        .filter((item) => item.capturedAt >= since)
+      const freshFrames = (this.capturedFrames.get(page) ?? []).filter(
+        (item) => item.capturedAt >= since,
+      );
+      const frames = freshFrames
         .sort((left, right) => left.capturedAt - right.capturedAt)
         .map((item) => item.text);
       if (frames.length === 0) {
         return undefined;
       }
       const reduced = reduceGrokStream(frames);
-      return reduced && (reduced.content || reduced.reasoningContent) ? reduced : undefined;
+      if (reduced && (reduced.content || reduced.reasoningContent)) {
+        return reduced;
+      }
+      // 归约不出内容时，先问问站点自己是不是报错了——配额用完时它**不给正文**，
+      // 只给一个错误事件。原来这里一律返回 undefined，错误就一路退化成
+      // "未能稳定提取 grok 的回复内容"，真正的原因被吞掉了。
+      const failure = detectProviderStreamError(
+        providerId,
+        freshFrames.map((item) => item.text).join('\n'),
+      );
+      return failure
+        ? { content: '', reasoningContent: '', finished: false, error: failure.message }
+        : undefined;
     }
 
     if (reducer === 'claude') {
-      // Claude 走会话快照 JSON 而不是 SSE：它的 SSE 里中文是坏的
-      // （UTF-8 被按 CP1252 逐字节误解码），而 JSON 端点的文字正确。
-      // 从后往前找——快照是累积的，最后一份必然包含完整的这一轮。
+      // **会话 JSON 快照优先，SSE 备选。**
+      //
+      // 早先这里反过来（SSE 优先），理由是"SSE 更早到"。实测推翻了这个取舍：
+      // Claude 的 SSE 会**间歇性**把中文按 CP1252 误解码发出来，正文变成
+      // 「åŒæ ·çš†è±†å­åï¼Œç»"æžœå·®å«å¤§」这种乱码（2026-10-13 复现）。
+      // 试过用 CP1252 反解回去，单趟修不回来，所以不是简单的编码往返——
+      // 原因还没查清。
+      //
+      // 会话 JSON 快照那份的文字一直是逐字正确的（早先记录里"Claude 的 SSE 中文是坏的"
+      // 那条结论，方向是对的，只是当时误以为 SSE 毫无可用之处）。所以这里以它为准，
+      // SSE 只在快照没抓到时顶上。
       for (const item of [...matched].reverse()) {
         const reduced = reduceClaudeConversation(item.text);
         if (reduced && (reduced.content || reduced.reasoningContent)) {
           return reduced;
+        }
+      }
+      for (const item of [...matched].reverse()) {
+        const streamed = reduceClaudeStream(parseSseEvents(item.text).map((event) => event.data));
+        if (streamed && (streamed.content || streamed.reasoningContent)) {
+          return streamed;
         }
       }
       return undefined;
@@ -576,7 +689,10 @@ export class BrowserManager {
       }
     }
 
-    return undefined;
+    const failure = detectProviderStreamError(providerId, matched.map((m) => m.text).join('\n'));
+    return failure
+      ? { content: '', reasoningContent: '', finished: false, error: failure.message }
+      : undefined;
   }
 
   /**
@@ -684,7 +800,7 @@ export class BrowserManager {
 
   async createEphemeralPage(providerId: ProviderId): Promise<Page> {
     await this.init();
-    const page = await this.createBackgroundPage().catch(() => this.context!.newPage());
+    const page = await this.createBackgroundPage(providerId).catch(() => this.context!.newPage());
     await page.goto(getProvider(providerId).url, { waitUntil: 'domcontentloaded' });
     return page;
   }
@@ -1498,20 +1614,29 @@ export class BrowserManager {
     }
   }
 
-  private async createBackgroundPage(): Promise<Page> {
+  private async createBackgroundPage(providerId?: ProviderId): Promise<Page> {
     const browser = this.context?.browser();
+    let page: Page;
     if (!this.context || !browser) {
-      return this.context!.newPage();
+      page = await this.context!.newPage();
+    } else {
+      const pagePromise = this.context.waitForEvent('page', { timeout: 4000 });
+      try {
+        const cdp = await browser.newBrowserCDPSession();
+        await cdp.send('Target.createTarget', { url: 'about:blank', background: true });
+        page = await pagePromise;
+      } catch {
+        page = await this.context.newPage();
+      }
     }
 
-    const pagePromise = this.context.waitForEvent('page', { timeout: 4000 });
-    try {
-      const cdp = await browser.newBrowserCDPSession();
-      await cdp.send('Target.createTarget', { url: 'about:blank', background: true });
-      return await pagePromise;
-    } catch {
-      return this.context.newPage();
+    // 页内 hook 必须在导航之前装上，所以放在建页这一步（见 installInPageHook 的说明）。
+    if (providerId) {
+      await this.installInPageHook(page, providerId).catch((error: unknown) => {
+        console.warn(`[h] ${providerId} 装 hook 失败：${String(error).slice(0, 140)}`);
+      });
     }
+    return page;
   }
 
   private getSessionKey(providerId: ProviderId, conversationId?: string): string {

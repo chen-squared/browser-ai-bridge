@@ -33,6 +33,8 @@ const selectorOverrideSchema = z.object({
        * 不配则只走 finished()+body()（对会正常收尾的响应仍然够用）。
        */
       endpointGlob: z.string().optional(),
+      /** 是否启用页内 hook 取流（真首字延迟）。见 browser/inpage-hook.ts。 */
+      inPageCapture: z.boolean().optional(),
       transport: z.enum(['http', 'websocket']),
       /**
        * 每个 reducer 对应一套协议，**不能跨 provider 复用**：
@@ -133,7 +135,6 @@ const defaultProviders: Record<ProviderId, ProviderConfig> = {
       // 于是 finished() 一直不 resolve、body() 抛 No data found，真流整条丢失，
       // 只能退回 DOM（而新 DOM 里连 article / data-message-author-role 都没了）。
       // 所以这里必须走 CDP Fetch 的增量读，逐块取，不等它结束。
-      endpointGlob: '*backend-api/f/conversation',
       transport: 'http',
       reducer: 'chatgpt',
     },
@@ -473,6 +474,12 @@ const defaultProviders: Record<ProviderId, ProviderConfig> = {
       endpointPattern: '\\/api\\/v0\\/chat\\/completion',
       transport: 'http',
       reducer: 'deepseek',
+      // 页内 hook 的**逐帧下推**（`stream:true` 时的真首字延迟）暂时关着：
+      // 开了之后 `stream:true` 会退回 DOM、只拿到回答的尾巴加页脚免责声明，
+      // 还没查清。逐块捕获本身是通的（页内探针六家全部拿到真逐块数据），
+      // 差的是"逐帧推给客户端"这一步。
+      //
+      // inPageCapture: true,
     },
     label: 'DeepSeek',
     url: 'https://chat.deepseek.com/',
