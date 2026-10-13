@@ -275,24 +275,40 @@ describe('总结者的会话来源', () => {
     );
   });
 
-  it('summarizerSeat 指向不存在的席位时退回新会话，而不是静默复用错的', () => {
-    const resolved = plan({
-      participants: ['chatgpt', 'deepseek'],
-      summarizer: 'qwen',
-      summarizerSeat: 'grok9',
-    });
-    assert.equal(resolved.summarizer.alias, 'qwen-summary');
+  it('summarizerSeat 指向不存在的席位时当场报错，不静默换成一个新会话', () => {
+    // 静默退回新会话是最坏的：界面显示"复用 grok9"，实际开的是新会话，
+    // 用户以为总结者记得讨论内容，其实它什么都看不到。
+    assert.throws(
+      () =>
+        plan({
+          participants: ['chatgpt', 'deepseek'],
+          summarizer: 'qwen',
+          summarizerSeat: 'grok9',
+        }),
+      /找不到名为 grok9 的席位/,
+    );
   });
 
-  it('总结者 provider 与被复用席位不同也不影响复用（以席位为准）', () => {
-    // 席位名已编码 provider，这里防的是有人后来改成"按 provider 匹配"
+  it('跨 provider 复用当场报错：复用靠的是同名 ⇒ 同标签页，换模型就不成立', () => {
+    assert.throws(
+      () =>
+        plan({
+          participants: ['deepseek', 'chatgpt'],
+          summarizer: 'qwen',
+          summarizerSeat: 'deepseek1',
+        }),
+      /不是同一个模型/,
+    );
+  });
+
+  it('同 provider 的席位照常复用', () => {
     const resolved = plan({
       participants: ['deepseek', 'chatgpt'],
-      summarizer: 'qwen',
+      summarizer: 'deepseek',
       summarizerSeat: 'deepseek1',
     });
-    assert.equal(resolved.summarizer.provider, 'qwen', 'provider 仍按请求走');
-    assert.equal(resolved.summarizer.alias, 'deepseek1', '会话身份按席位走');
+    assert.equal(resolved.summarizer.alias, 'deepseek1');
+    assert.equal(resolved.summarizer.provider, 'deepseek');
   });
 });
 
@@ -326,5 +342,80 @@ describe('席位上限必须容得下一次会议', () => {
       limit >= 7,
       `标签页上限 ${limit} 容不下「6 个同 provider 席位 + 1 个总结者」所需的 7 个`,
     );
+  });
+});
+
+describe('有人掉链子不能拖垮整场会议', () => {
+  const payloadFor = (mode: 'round-robin' | 'parallel'): CompletionPayload => ({
+    model: mode === 'parallel' ? 'meeting-parallel-web' : 'meeting-round-robin-web',
+    messages: [{ role: 'user', content: '用两字形容雪' }],
+    meeting: { participants: ['chatgpt', 'claude', 'gemini'], summarizer: 'qwen', rounds: 1 },
+  });
+
+  const failing = (failProvider: string, seen: string[]) => {
+    return async (input: { provider?: string; messages: { content: string }[] }) => {
+      const provider = input.provider ?? '';
+      if (provider === failProvider) {
+        throw new Error(`${provider} 没能确认这一轮是否真的发出去了`);
+      }
+      seen.push(provider);
+      return { provider, model: `${provider}-web`, content: `${provider} 的回答` };
+    };
+  };
+
+  it('并行时一个人失败，其他人和总结照常跑完', async () => {
+    const seen: string[] = [];
+    const { runMeetingCompletion } = await import('../src/meeting.js');
+    const result = await runMeetingCompletion(
+      payloadFor('parallel'),
+      meetingModelTemplates['meeting-parallel-web'],
+      failing('claude', seen) as never,
+    );
+
+    const entries = result.meeting?.turnEntries ?? [];
+    assert.ok(
+      entries.some((e) => e.content.includes('claude1') && e.content.includes('没能完成')),
+      '失败的人要留一条说明，不能凭空消失',
+    );
+    assert.ok(
+      entries.some((e) => e.content === 'chatgpt 的回答'),
+      '没挂的人照常交稿',
+    );
+    assert.ok(
+      entries.some((e) => e.stage === 'summary' && e.content.includes('qwen 的回答')),
+      '总结照样要跑——一场会议本来就有冗余',
+    );
+    assert.match(result.choices?.[0]?.message?.content ?? '', /qwen 的回答/);
+  });
+
+  it('顺序时中间一个人失败，后面的席位继续接力', async () => {
+    const seen: string[] = [];
+    const { runMeetingCompletion } = await import('../src/meeting.js');
+    const result = await runMeetingCompletion(
+      payloadFor('round-robin'),
+      meetingModelTemplates['meeting-round-robin-web'],
+      failing('claude', seen) as never,
+    );
+
+    const entries = result.meeting?.turnEntries ?? [];
+    assert.ok(seen.includes('gemini'), '排在后面的人不该因为前面挂了就轮不到');
+    assert.ok(entries.some((e) => e.stage === 'summary'));
+  });
+
+  it('总结者自己挂了，也只是缺一段说明，不该整场清空', async () => {
+    const seen: string[] = [];
+    const { runMeetingCompletion } = await import('../src/meeting.js');
+    const result = await runMeetingCompletion(
+      payloadFor('round-robin'),
+      meetingModelTemplates['meeting-round-robin-web'],
+      failing('qwen', seen) as never,
+    );
+
+    const entries = result.meeting?.turnEntries ?? [];
+    assert.ok(
+      entries.some((e) => e.content === 'chatgpt 的回答'),
+      '发言必须保住',
+    );
+    assert.match(result.choices?.[0]?.message?.content ?? '', /没能完成/);
   });
 });

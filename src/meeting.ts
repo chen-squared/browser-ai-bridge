@@ -15,6 +15,11 @@ export type CompletionPayload = {
   injectSystemOnFirstTurn?: boolean;
   sessionTranscriptMode?: 'raw' | 'context-window';
   dryRun?: boolean;
+  /**
+   * 要逐字增量。内部调用时打开，好让 WebSocket 型 provider（Grok）把增量
+   * 推到页面，用户能第一时间看到首字，而不是对着空白等整段写完。
+   */
+  stream?: boolean;
   meeting?: {
     participants?: ProviderId[];
     rounds?: number;
@@ -94,6 +99,44 @@ export type MeetingProgressEvent =
       entry: MeetingTranscriptEntry;
     }
   | {
+      /**
+       * 某人开始写了。
+       *
+       * 没有它，页面上只有一个笼统的「正在处理中」，而且第一条发言到达就被撤掉了。
+       * 走 HTTP 的 provider 推不出增量，于是从"他开始写"到"他写完"这整段时间里
+       * 屏幕上什么都不显示——用户根本分不清是在跑还是卡住了。发了这个事件，
+       * 对应的人就先冒出来，文字再慢慢填进去。
+       */
+      type: 'meeting.speaking';
+      meeting: {
+        conversationId: string;
+        template: string;
+      };
+      speaker: string;
+      provider: ProviderId;
+      round: number;
+    }
+  | {
+      /**
+       * 某人正在写，边写边推。
+       *
+       * 只有走 WebSocket 的 provider（Grok）真正拿得到增量：它的帧是一帧一帧
+       * 到达的，能测出真实的首字延迟。走 HTTP SSE 的 provider 只能在生成结束后
+       * 一次性取到 body，推不了增量——那种情况下这个事件根本不会发，页面会等到
+       * `meeting.entry` 才一次性显示。
+       */
+      type: 'meeting.delta';
+      meeting: {
+        conversationId: string;
+        template: string;
+      };
+      speaker: string;
+      provider: ProviderId;
+      round: number;
+      contentDelta?: string;
+      reasoningDelta?: string;
+    }
+  | {
       type: 'meeting.completed';
       meeting: {
         conversationId: string;
@@ -102,56 +145,68 @@ export type MeetingProgressEvent =
       response: unknown;
     };
 
+/**
+ * 各成员负责的角度。
+ *
+ * 原来是同一句话抄三遍：「沿着统筹者拆出来的子问题推进」。分工全靠统筹者在
+ * 提示词里现编，结果模型被训练成"服从派任务的执行者"，而不是各自拿出真东西。
+ *
+ * 改成**角度**而不是**任务**：任务要等别人分派，角度自己就能站住。把它们按席位
+ * 顺序铺开，于是三个成员天然分工不同，不需要统筹者去协调。
+ */
+const DISCUSSION_ANGLES = [
+  '摆事实和依据：到底是什么、有哪些现成做法',
+  '讲实现路径和代价：真要落地怎么走、要付出什么',
+  '挑反例和边界：什么情况下这套根本不成立',
+  '比取舍：几个方案之间该怎么选，标准是什么',
+  '落到人身上：真实使用者的感受和实际影响',
+  '指风险和未决的地方：哪里还不确定',
+];
+
+function briefAt(index: number): string {
+  return DISCUSSION_ANGLES[index % DISCUSSION_ANGLES.length];
+}
+
 export const meetingModelTemplates: Record<string, MeetingTemplate> = {
   'meeting-round-robin-web': {
     id: 'meeting-round-robin-web',
     label: '轮流讨论会议',
-    description: '统筹者先拆题并做自己的第一段分析，其他成员按顺序补充，最后由统筹者统一收口。',
+    description: '负责人先给出自己的判断，其他成员按顺序接着补，最后由负责人收口。',
     mode: 'round-robin',
     rounds: 2,
     participants: [
-      {
-        alias: 'member-1',
-        provider: 'chatgpt',
-        brief: '沿着统筹者拆出来的子问题推进，补足事实、实现路径或反例',
-      },
-      {
-        alias: 'member-2',
-        provider: 'qwen',
-        brief: '沿着统筹者拆出来的子问题推进，补足事实、实现路径或反例',
-        enableReasoning: true,
-      },
+      { alias: 'member-1', provider: 'chatgpt', brief: briefAt(0) },
+      { alias: 'member-2', provider: 'qwen', brief: briefAt(1), enableReasoning: true },
+      { alias: 'member-3', provider: 'claude', brief: briefAt(2) },
+      { alias: 'member-4', provider: 'gemini', brief: briefAt(3) },
+      { alias: 'member-5', provider: 'grok', brief: briefAt(4) },
+      { alias: 'member-6', provider: 'deepseek', brief: briefAt(5) },
     ],
     summarizer: {
       provider: 'deepseek',
       alias: 'lead',
-      brief: '先拆解用户问题并完成自己的那部分分析，最后负责把结论收束成一条答复',
+      brief: '先给出自己的判断，最后把全场的结论收成一条答复',
       enableReasoning: true,
     },
   },
   'meeting-parallel-web': {
     id: 'meeting-parallel-web',
     label: '并行讨论会议',
-    description: '统筹者先拆题并做自己的第一段分析，其他成员并行推进，最后由统筹者统一汇总。',
+    description: '负责人先给出自己的判断，其他成员同时作答，最后由负责人汇总。',
     mode: 'parallel',
     rounds: 2,
     participants: [
-      {
-        alias: 'member-1',
-        provider: 'gemini',
-        brief: '沿着统筹者拆出来的子问题推进，补足事实、实现路径或反例',
-      },
-      {
-        alias: 'member-2',
-        provider: 'qwen',
-        brief: '沿着统筹者拆出来的子问题推进，补足事实、实现路径或反例',
-        enableReasoning: true,
-      },
+      { alias: 'member-1', provider: 'gemini', brief: briefAt(0) },
+      { alias: 'member-2', provider: 'qwen', brief: briefAt(1), enableReasoning: true },
+      { alias: 'member-3', provider: 'claude', brief: briefAt(2) },
+      { alias: 'member-4', provider: 'chatgpt', brief: briefAt(3) },
+      { alias: 'member-5', provider: 'grok', brief: briefAt(4) },
+      { alias: 'member-6', provider: 'deepseek', brief: briefAt(5) },
     ],
     summarizer: {
       provider: 'deepseek',
       alias: 'lead',
-      brief: '先拆解用户问题并完成自己的那部分分析，最后负责把结论收束成一条答复',
+      brief: '先给出自己的判断，最后把全场的结论收成一条答复',
       enableReasoning: true,
     },
   },
@@ -206,6 +261,28 @@ export function resolveMeetingPlan(
   const reusable = requestedSeat
     ? participants.find((participant) => participant.alias === requestedSeat)
     : undefined;
+
+  // 「复用某席位的会话」只有总结者**就是那个席位**时才成立。
+  //
+  // 复用靠的是同名 ⇒ 同 conversationId ⇒ 命中同一个浏览器标签页。跨 provider
+  // 时这条路根本不存在：alias 叫 chatgpt1 而 provider 是 qwen，开出来的其实是
+  // 一个挂着 chatgpt 名字的全新 qwen 会话，界面提示「会在 chatgpt1 的同一个会话
+  // 里收口」是假的。与其悄悄做错，不如当场说清楚。
+  if (requestedSeat && !reusable) {
+    throw new Error(
+      `找不到名为 ${requestedSeat} 的席位。当前席位是 ${participants
+        .map((participant) => participant.alias)
+        .join('、')}。`,
+    );
+  }
+  if (reusable && reusable.provider !== summarizerProvider) {
+    throw new Error(
+      `${reusable.alias} 是 ${reusable.provider} 的席位，总结者选的是 ${summarizerProvider}，` +
+        `两者不是同一个模型，没法复用同一个网页会话。` +
+        `要复用就把总结者改成 ${reusable.provider}；想开新会话就把「总结用哪个会话」留空。`,
+    );
+  }
+
   const summarizerAlias = reusable ? reusable.alias : `${summarizerProvider}-summary`;
 
   return {
@@ -277,32 +354,92 @@ function getDiscussionParticipantsForRound(
   return plan.participants.filter((participant) => aliases.has(participant.alias));
 }
 
+/**
+ * 流水线式启动：每隔 {@link PARALLEL_STAGGER_MS} 毫秒才发起下一个。
+ *
+ * 原来是 `Promise.all` 一次性全发出去。同一个浏览器里每个 provider 都要新开标签页
+ * 并加载重 SPA，同时起就互相抢资源——实测只要 ChatGPT 在其中，同场的 Gemini 就会
+ * `未能稳定提取`，Claude 更惨，退回 DOM 后抓到的是首屏问候语
+ * （`How can I help you today?`），而不是回答。
+ *
+ * 错开之后仍然是"并行"：总耗时接近最慢的那一个，而不是所有人之和；
+ * 但不会再在大家都还没加载完的时候一起冲进去。
+ */
+const PARALLEL_STAGGER_MS = 1500;
+
+async function startStaggered<T, R>(
+  items: readonly T[],
+  start: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  const tasks: Promise<R>[] = [];
+  for (const [index, item] of items.entries()) {
+    if (index > 0) {
+      await new Promise((resolve) => setTimeout(resolve, PARALLEL_STAGGER_MS));
+    }
+    tasks.push(start(item, index));
+  }
+  return Promise.all(tasks);
+}
+
 export function buildDiscussionMessages(
   seedMessages: ChatMessage[],
-  transcript: MeetingTranscriptEntry[],
+  _transcript: MeetingTranscriptEntry[],
   prompt: string,
 ): ChatMessage[] {
-  const historyMessages: ChatMessage[] = transcript.map((entry) => ({
-    role: entry.role,
-    name: entry.speaker,
-    content: entry.content,
-  }));
-
+  // 接力链的形态：上下文就写在 prompt 正文里（问题 + 一行行的「某某说：……」），
+  // 不再把 transcript 当聊天历史重放一遍——那样同一个内容会出现两次
+  // （一次在历史里、一次在 prompt 里），模型容易被带偏。
   return [
     ...seedMessages.filter((message) => message.role === 'system'),
-    ...historyMessages,
     { role: 'user', content: prompt },
   ];
+}
+
+/**
+ * 拼接力链的 prompt。
+ *
+ * 就是最朴素的形态：问题在前，别人说过的话一行行接在后面，需要收口的那位
+ * 再加一句"总结一下他们的内容"。不解释这是什么会议、不分配角色、不报轮次。
+ */
+export function buildRelayPrompt(
+  question: string,
+  chain: readonly MeetingTranscriptEntry[],
+  options?: { summarize?: boolean; react?: boolean },
+): string {
+  const lines = [question.trim()];
+
+  if (chain.length > 0) {
+    lines.push('');
+    for (const entry of chain) {
+      const body = (entry.content || '').trim();
+      if (!body) {
+        continue;
+      }
+      lines.push(`${entry.speaker}说：${body}`);
+    }
+  }
+
+  // 接力的人被问了一句"你怎么看"，所以他会真的回应上面那些话，
+  // 而不是从头再答一遍。收口那位则只要总结。
+  if (options?.react) {
+    lines.push('');
+    lines.push('你觉得怎么样');
+  }
+  if (options?.summarize) {
+    lines.push('');
+    lines.push('总结一下他们的内容。');
+  }
+
+  return lines.join('\n');
 }
 
 export function formatReasoningTranscript(entries: MeetingTranscriptEntry[]): string {
   return entries
     .filter((entry) => entry.stage !== 'summary')
     .map((entry) => {
-      const stagePrefix = entry.stage === 'assignment' ? '分工 · ' : '';
       const roundPrefix = entry.round ? `第 ${entry.round} 轮 · ` : '';
       const providerSuffix = entry.provider ? ` · ${entry.provider}` : '';
-      return `### ${stagePrefix}${roundPrefix}${entry.speaker}${providerSuffix}\n${entry.content}`;
+      return `### ${roundPrefix}${entry.speaker}${providerSuffix}\n${entry.content}`;
     })
     .join('\n\n');
 }
@@ -316,6 +453,10 @@ export async function runMeetingCompletion(
       model: string;
       messages: ChatMessage[];
       conversationId?: string;
+    },
+    options?: {
+      /** 逐字增量。只有走 WebSocket 的 provider（Grok）真推得出来。 */
+      onDelta?: (delta: { contentDelta?: string; reasoningDelta?: string }) => void;
     },
   ) => Promise<{
     provider: ProviderId;
@@ -349,14 +490,12 @@ export async function runMeetingCompletion(
   // 而不是把整场会议反复叠加进历史。
   const turnStartIndex = transcript.length;
   const effectiveConversationId = payload.conversationId ?? `meeting-${randomUUID()}`;
-  const roster = buildMeetingRoster(plan);
-  const _discussionParticipants = plan.participants.filter((participant) =>
-    policy.discussionParticipants.includes(participant.alias),
-  );
-  const assignmentParticipants = plan.participants.filter(
-    (participant) => participant.alias !== plan.summarizer.alias,
-  );
-  const memberAliasList = assignmentParticipants.map((participant) => participant.alias).join('、');
+  // 接力链永远从"用户这个问题"开始。取最后一条 user 消息，多轮提问时就是本轮那条。
+  const latestQuestion =
+    [...seedMessages]
+      .reverse()
+      .find((message) => message.role === 'user')
+      ?.content.trim() ?? '';
   const pageUrls: Array<{ speaker: string; provider: ProviderId; url?: string }> = [];
 
   await options?.onProgress?.({
@@ -373,94 +512,60 @@ export async function runMeetingCompletion(
     },
   });
 
-  const assignmentPrompt = [
-    `你是这场会议的负责人 ${plan.summarizer.alias}，底层 provider 是 ${plan.summarizer.provider}。`,
-    `本场会议总共有 ${plan.rounds} 轮成员讨论。你的职责是先给其他成员分工，同时先完成你自己负责的那部分分析，再在最后统一总结。`,
-    `固定成员只有：${roster}。不要创造新成员，不要让成员继续无限制地互相指派任务。`,
-    assignmentParticipants.length > 0
-      ? `请先逐一给 ${memberAliasList} 分工，明确每个人应该从什么角度推进。`
-      : '本场没有其他成员需要分工，请直接说明这一点，然后继续完成你自己负责的分析。',
-    '要求：分工要足够抽象，不要把方案内容替他们直接写完；要让他们在有限轮次内能推进。',
-    `请显式提醒：他们只有 ${plan.rounds} 轮可用，需要在轮次内完成推进，不要把任务留到轮次结束后。`,
-    '在分工之后，立刻继续输出你自己负责的部分：给出你的初步判断、整体框架、关键分歧或风险点。不要等待下一条消息再开始做你自己的部分。',
-    '输出顺序要求：先写“分工”，再写“lead 的初步分析”。',
-  ].join('\n');
-
-  const assignmentResult = await completeWithProvider({
-    ...payload,
-    provider: plan.summarizer.provider,
-    model: `${plan.summarizer.provider}-web`,
-    conversationId: `${effectiveConversationId}:${plan.summarizer.alias}:${plan.summarizer.provider}`,
-    messages: buildDiscussionMessages(seedMessages, transcript, assignmentPrompt),
-    enableReasoning: plan.summarizer.enableReasoning,
-    promptMode: 'full-messages',
-    sessionTranscriptMode: 'context-window',
-    injectSystemOnFirstTurn: true,
-  });
-
-  transcript.push({
-    role: 'assistant',
-    speaker: plan.summarizer.alias,
-    provider: plan.summarizer.provider,
-    stage: 'assignment',
-    content: assignmentResult.content || '',
-  });
-  await options?.onProgress?.({
-    type: 'meeting.entry',
-    meeting: {
-      conversationId: effectiveConversationId,
-      template: plan.id,
-    },
-    entry: transcript[transcript.length - 1],
-  });
-  pageUrls.push({
-    speaker: plan.summarizer.alias,
-    provider: plan.summarizer.provider,
-    url: assignmentResult.url,
-  });
-
+  // 没有"分工"阶段了。第一个发言的人直接回答用户的问题。
   const runParticipantTurn = async (
     participant: MeetingParticipantPlan,
     round: number,
-    priorTranscript: MeetingTranscriptEntry[],
-    turnPosition?: number,
-    turnTotal?: number,
+    chain: MeetingTranscriptEntry[],
   ) => {
-    const remainingRounds = Math.max(plan.rounds - round, 0);
-    const discussionPrompt = [
-      `你正在参加一个多 AI 会议。你的固定身份是 ${participant.alias}，底层 provider 是 ${participant.provider}。`,
-      `你的职责：${participant.brief}。`,
-      `固定参会成员：${roster}。`,
-      `当前是第 ${round} / ${plan.rounds} 轮，本轮结束后还剩 ${remainingRounds} 轮。请直接延续上面的完整聊天历史作答，不要假装自己是最终客服，不要重复转述全部上下文。`,
-      plan.mode === 'round-robin' && turnPosition && turnTotal
-        ? `本轮按顺序轮流发言。你是本轮第 ${turnPosition} / ${turnTotal} 位发言者，请只推进你负责的那一部分，并显式承接前面已出现的观点。`
-        : null,
-      '请优先执行总结者刚才分配给你的任务，不要重新给其他成员派新任务。',
-      plan.mode === 'round-robin'
-        ? '这是轮流讨论模板。请在吸收前面发言后，推进你负责的部分，长度控制在 3 到 6 句。'
-        : '这是并行讨论模板。请基于已有聊天与会议历史，推进你负责的部分，长度控制在 3 到 6 句。',
-      remainingRounds === 0
-        ? '这是最后一轮。请把你负责的部分尽量收束清楚，不要再要求别人后续补充。'
-        : '如果需要其他成员配合，只能提出非常有限的补充点，避免把任务拖到最后一轮之后。',
-      plan.mode === 'round-robin'
-        ? '除非这是最后总结阶段，否则不要把自己写成会议最终答复人，也不要提前替全场收尾。'
-        : null,
-    ]
-      .filter(Boolean)
-      .join('\n');
-
-    const result = await completeWithProvider({
-      ...payload,
-      provider: participant.provider,
-      model: `${participant.provider}-web`,
-      conversationId: `${effectiveConversationId}:${participant.alias}:${participant.provider}`,
-      messages: buildDiscussionMessages(seedMessages, priorTranscript, discussionPrompt),
-      enableSearch: participant.enableSearch,
-      enableReasoning: participant.enableReasoning,
-      promptMode: 'full-messages',
-      sessionTranscriptMode: 'context-window',
-      injectSystemOnFirstTurn: true,
+    // 接力链：问题 + 前面每个人说过的话，一行一个「某某说：……」。
+    // 顺序模式下第一个人只看到问题，从第二个起被问一句"你觉得怎么样"，
+    // 于是会真的回应上面那些话。并行模式下同轮所有人看到的都一样（只有问题），
+    // 也就没有可回应的内容，所以不加那句。
+    const discussionPrompt = buildRelayPrompt(latestQuestion, chain, {
+      react: plan.mode === 'round-robin' && chain.length > 0,
     });
+
+    // 先报"他开始写了"，页面上对应的气泡立刻出现，不用等第一段文字。
+    void options?.onProgress?.({
+      type: 'meeting.speaking',
+      meeting: { conversationId: effectiveConversationId, template: plan.id },
+      speaker: participant.alias,
+      provider: participant.provider,
+      round,
+    });
+
+    const result = await completeWithProvider(
+      {
+        ...payload,
+        provider: participant.provider,
+        model: `${participant.provider}-web`,
+        conversationId: `${effectiveConversationId}:${participant.alias}:${participant.provider}`,
+        messages: buildDiscussionMessages(seedMessages, chain, discussionPrompt),
+        enableSearch: participant.enableSearch,
+        enableReasoning: participant.enableReasoning,
+        promptMode: 'full-messages',
+        sessionTranscriptMode: 'context-window',
+        injectSystemOnFirstTurn: true,
+        // 逐字往外推。Grok 走 WebSocket，帧是一帧一帧到的，于是用户能看到
+        // 首字就冒出来；HTTP 的 provider 推不出增量，这个回调根本不会被调，
+        // 页面会一直等到下面那条 meeting.entry 才一次性显示。
+        stream: true,
+      },
+      {
+        onDelta: (delta) => {
+          void options?.onProgress?.({
+            type: 'meeting.delta',
+            meeting: { conversationId: effectiveConversationId, template: plan.id },
+            speaker: participant.alias,
+            provider: participant.provider,
+            round,
+            ...(delta.contentDelta ? { contentDelta: delta.contentDelta } : {}),
+            ...(delta.reasoningDelta ? { reasoningDelta: delta.reasoningDelta } : {}),
+          });
+        },
+      },
+    );
 
     pageUrls.push({ speaker: participant.alias, provider: participant.provider, url: result.url });
 
@@ -472,6 +577,35 @@ export async function runMeetingCompletion(
       round,
       content: result.content || '',
     } satisfies MeetingTranscriptEntry;
+  };
+
+  /**
+   * 跑一个人的发言，失败不往外抛，而是变成一条"他没成"的发言。
+   *
+   * 以前是直接抛：并行时 `Promise.all` 里任何一个人失败，整场会议立刻结束，
+   * 已经跑完的人���发言全被丢掉——用户看到的是"生成到一半弹了个错，
+   * 记录里一条都没有"。顺序模式也一样，中间一个人挂了后面全都不跑。
+   *
+   * 一场会议本来就有冗余：少一个人发言，总结照样能收口，总比整场白跑强。
+   */
+  const runParticipantTurnSafely = async (
+    participant: MeetingParticipantPlan,
+    round: number,
+    chain: MeetingTranscriptEntry[],
+  ): Promise<MeetingTranscriptEntry> => {
+    try {
+      return await runParticipantTurn(participant, round, chain);
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      return {
+        role: 'assistant' as const,
+        speaker: participant.alias,
+        provider: participant.provider,
+        stage: 'discussion' as const,
+        round,
+        content: `（${participant.alias} 这一轮没能完成：${reason}）`,
+      } satisfies MeetingTranscriptEntry;
+    }
   };
 
   if (payload.dryRun) {
@@ -525,10 +659,15 @@ export async function runMeetingCompletion(
 
   for (let round = 1; round <= plan.rounds; round += 1) {
     const roundParticipants = getDiscussionParticipantsForRound(plan, policy, round);
+    // 上一轮（含更早）说过的话，作为本轮的起点。顺序模式下同轮内还要一个个追加，
+    // 并行模式下同轮所有人看到的完全一样——所以谁也引用不了谁。
+    const beforeRound = transcript
+      .filter((entry) => entry.stage === 'discussion')
+      .map((e) => ({ ...e }));
+
     if (plan.mode === 'parallel') {
-      const roundSeed = transcript.map((entry) => ({ ...entry }));
-      const roundEntries = await Promise.all(
-        roundParticipants.map((participant) => runParticipantTurn(participant, round, roundSeed)),
+      const roundEntries = await startStaggered(roundParticipants, (participant) =>
+        runParticipantTurnSafely(participant, round, beforeRound),
       );
       transcript.push(...roundEntries);
       for (const entry of roundEntries) {
@@ -542,14 +681,13 @@ export async function runMeetingCompletion(
         });
       }
     } else {
-      for (const [participantIndex, participant] of roundParticipants.entries()) {
-        const entry = await runParticipantTurn(
-          participant,
-          round,
-          transcript,
-          participantIndex + 1,
-          roundParticipants.length,
-        );
+      for (const participant of roundParticipants) {
+        // 传 transcript 本身：它一直在增长，于是每个人拿到的链都是"到这儿为止的
+        // 全部发言"。这就是接力。
+        const entry = await runParticipantTurnSafely(participant, round, [
+          ...beforeRound,
+          ...transcript.filter((e) => e.stage === 'discussion' && e.round === round),
+        ]);
         transcript.push(entry);
         await options?.onProgress?.({
           type: 'meeting.entry',
@@ -563,24 +701,67 @@ export async function runMeetingCompletion(
     }
   }
 
-  const summaryPrompt = [
-    `你是本场会议的总结人 ${plan.summarizer.alias}，底层 provider 是 ${plan.summarizer.provider}。`,
-    `你前面已经给其他成员做过任务分工，并完成了自己的初步分析。现在请基于用户消息、你的首轮分工与分析，以及 ${plan.rounds} 轮讨论结果收束最终答复。`,
-    '请基于上面的全部聊天历史与会议讨论，只输出最后给用户的正式回答。',
-    '要求：保留结论、关键依据和建议动作；不要复述会议流程；不要再模拟其他参会者。',
-  ].join('\n');
+  const summaryPrompt = buildRelayPrompt(
+    latestQuestion,
+    transcript.filter((e) => e.stage === 'discussion'),
+    {
+      summarize: true,
+    },
+  );
 
-  const summaryResult = await completeWithProvider({
-    ...payload,
+  void options?.onProgress?.({
+    type: 'meeting.speaking',
+    meeting: { conversationId: effectiveConversationId, template: plan.id },
+    speaker: plan.summarizer.alias,
     provider: plan.summarizer.provider,
-    model: `${plan.summarizer.provider}-web`,
-    conversationId: `${effectiveConversationId}:${plan.summarizer.alias}:${plan.summarizer.provider}`,
-    messages: buildDiscussionMessages(seedMessages, transcript, summaryPrompt),
-    enableReasoning: plan.summarizer.enableReasoning,
-    promptMode: 'full-messages',
-    sessionTranscriptMode: 'context-window',
-    injectSystemOnFirstTurn: true,
+    round: 0,
   });
+
+  let summaryResult: {
+    content?: string;
+    url?: string;
+    provider?: ProviderId;
+    model?: string;
+  };
+  try {
+    summaryResult = await completeWithProvider(
+      {
+        ...payload,
+        provider: plan.summarizer.provider,
+        model: `${plan.summarizer.provider}-web`,
+        conversationId: `${effectiveConversationId}:${plan.summarizer.alias}:${plan.summarizer.provider}`,
+        messages: buildDiscussionMessages(seedMessages, transcript, summaryPrompt),
+        enableReasoning: plan.summarizer.enableReasoning,
+        promptMode: 'full-messages',
+        sessionTranscriptMode: 'context-window',
+        injectSystemOnFirstTurn: true,
+        stream: true,
+      },
+      {
+        // 总结同样是逐字推，用户不用对着空白等它写完。
+        onDelta: (delta) => {
+          void options?.onProgress?.({
+            type: 'meeting.delta',
+            meeting: { conversationId: effectiveConversationId, template: plan.id },
+            speaker: plan.summarizer.alias,
+            provider: plan.summarizer.provider,
+            round: 0,
+            ...(delta.contentDelta ? { contentDelta: delta.contentDelta } : {}),
+            ...(delta.reasoningDelta ? { reasoningDelta: delta.reasoningDelta } : {}),
+          });
+        },
+      },
+    );
+  } catch (error) {
+    // 总结挂了也别把前面所有人的发言一起带走。落一条说明，至少时间线还在，
+    // 用户还能看到大家说了什么、总结者为什么没成。
+    const reason = error instanceof Error ? error.message : String(error);
+    summaryResult = {
+      provider: plan.summarizer.provider,
+      model: `${plan.summarizer.provider}-web`,
+      content: `（总结者 ${plan.summarizer.alias} 这一步没能完成：${reason}）`,
+    };
+  }
 
   transcript.push({
     role: 'assistant',
@@ -588,6 +769,18 @@ export async function runMeetingCompletion(
     provider: plan.summarizer.provider,
     stage: 'summary',
     content: summaryResult.content || '',
+  });
+  // 总结也要发 meeting.entry。原先只 push 进 transcript，靠末尾补发的 OpenAI 形状
+  // chunk 让页面单独渲染一张"统一答复"卡片——于是同一段话在页面上出现两次，
+  // 而且 meeting.speaking 占出来的那张气泡**永远没人替换**，收尾还留着
+  // 一个"正在写…"。
+  await options?.onProgress?.({
+    type: 'meeting.entry',
+    meeting: {
+      conversationId: effectiveConversationId,
+      template: plan.id,
+    },
+    entry: transcript[transcript.length - 1],
   });
   pageUrls.push({
     speaker: plan.summarizer.alias,
