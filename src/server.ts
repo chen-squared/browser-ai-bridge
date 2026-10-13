@@ -21,6 +21,18 @@ import {
   runMeetingCompletion,
 } from './meeting.js';
 import {
+  appendRunDelta,
+  appendRunEntry,
+  clearRun,
+  failRun,
+  finishRun,
+  getRun,
+  isRunning,
+  listRunningRuns,
+  setRunSpeaking,
+  startRun,
+} from './meeting-runs.js';
+import {
   getProvider,
   getSelectorOverridesPath,
   listProviders,
@@ -115,6 +127,63 @@ function isProviderId(value: unknown): value is ProviderId {
 
 function createMeetingId(): string {
   return `meeting-${randomUUID()}`;
+}
+
+const TYPE_LABEL: Record<string, string> = {
+  string: '字符串',
+  number: '数字',
+  boolean: '布尔值',
+  array: '数组',
+  object: '对象',
+  null: '空值',
+  undefined: '没传',
+  nan: 'NaN',
+};
+
+/**
+ * 把 Zod 校验错误翻成人话。
+ *
+ * 原来直接把 `error.message` 抛出去，客户端收到的是一整坨 JSON——里面带着
+ * `"code": "invalid_type"` 这种字段名。用户只看到「type error」，既不知道是哪个
+ * 字段、也不知道期望什么，等于没给信息（控制台和会议页都栽在这上面）。
+ *
+ * 顺带把当时的请求体记进日志：这类问题再出现时能直接看到传了什么，不用再猜。
+ */
+function describeValidationError(error: z.ZodError): string {
+  const parts = error.issues.slice(0, 3).map((issue) => {
+    const path = issue.path.join('.') || '请求体';
+    switch (issue.code) {
+      case 'invalid_type': {
+        const expected = TYPE_LABEL[issue.expected] ?? issue.expected;
+        const received = TYPE_LABEL[String(issue.received)] ?? String(issue.received);
+        return `${path} 应该是${expected}，实际收到${received}`;
+      }
+      case 'invalid_enum_value':
+        return `${path} 只能是 ${issue.options.join(' / ')} 之一，实际收到 ${String(issue.received)}`;
+      case 'too_big':
+        return `${path} 最大 ${issue.maximum}`;
+      case 'too_small':
+        return `${path} 最小 ${issue.minimum}`;
+      case 'unrecognized_keys':
+        return `多了不认识的字段：${issue.keys.join('、')}`;
+      default:
+        return `${path}：${issue.message}`;
+    }
+  });
+
+  const omitted = error.issues.length - parts.length;
+  return `参数不合法 —— ${parts.join('；')}${omitted > 0 ? `（另有 ${omitted} 处）` : ''}`;
+}
+
+/** 校验失败时把当时的请求体记下来，方便事后定位。 */
+function logRejectedRequest(route: string, body: unknown, error: z.ZodError): void {
+  let rendered: string;
+  try {
+    rendered = JSON.stringify(body ?? null).slice(0, 500);
+  } catch {
+    rendered = '(无法序列化)';
+  }
+  console.warn(`[校验失败] ${route} ${describeValidationError(error)} | 请求体: ${rendered}`);
 }
 
 /** 会议存储只初始化一次。 */
@@ -221,6 +290,7 @@ async function completeWithProvider(
     {
       take: (page, since) => browserManager.takeCapturedStream(page, provider, since),
       frames: (page, since) => browserManager.streamFrames(page, provider, since),
+      settled: (page, since) => browserManager.isStreamSettled(page, provider, since),
     },
     // 第三个参数：只用于人机验证——那种情况只能由人点，必须弹到前台
     (page) => browserManager.bringPageToFront(page),
@@ -284,37 +354,20 @@ async function completeWithProvider(
   const content = await browserManager.runExclusive(
     provider,
     payload.conversationId,
-    async (page) => {
-      try {
-        return await client.sendMessage(page, effectiveNormalizedPrompt, {
-          onDelta: options?.onDelta,
-          isContinuation: useContinuationMode,
-          enableSearch: payload.enableSearch,
-          enableReasoning: payload.enableReasoning,
-          promptMode: syncPlan.effectivePromptMode,
-          includeTrailingUserMessages: payload.includeTrailingUserMessages,
-          injectSystemOnFirstTurn: syncPlan.injectSystemOnFirstTurn,
-        });
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        const shouldFallbackToLatestResponse =
-          /未能稳定提取 .*回复内容|未提取到 .*有效回复文本/u.test(message);
-        if (!shouldFallbackToLatestResponse) {
-          throw error;
-        }
-
-        const fallbackResult = await client.extractLatestResponse(page);
-        const extractionItems = fallbackResult.debug?.extraction?.items;
-        if (extractionItems && extractionItems.length > 0) {
-          extractionItems[0] = {
-            ...extractionItems[0],
-            detail:
-              `发送后稳定提取失败，已回退为 latest-response 抓取: ${message}; ${extractionItems[0].detail ?? ''}`.trim(),
-          };
-        }
-        return fallbackResult;
-      }
-    },
+    async (page) =>
+      // 这里原本还有一条"回退到 latest-response 再刮一次页面"的路，已经删掉：
+      // 那一路抓到的通常是首屏问候语（Claude 的 `How can I help you today?`）
+      // 或侧栏导航，看着像答案，其实消息压根没发出去。
+      // `sendMessage` 自己会判断这种情况并给出明确报错。
+      client.sendMessage(page, effectiveNormalizedPrompt, {
+        onDelta: options?.onDelta,
+        isContinuation: useContinuationMode,
+        enableSearch: payload.enableSearch,
+        enableReasoning: payload.enableReasoning,
+        promptMode: syncPlan.effectivePromptMode,
+        includeTrailingUserMessages: payload.includeTrailingUserMessages,
+        injectSystemOnFirstTurn: syncPlan.injectSystemOnFirstTurn,
+      }),
   );
 
   browserManager.setSyncedMessages(provider, payload.conversationId, [
@@ -403,6 +456,7 @@ if (appConfig.bridgeToken) {
     pathname === '/health' ||
     pathname === '/' ||
     pathname === '/meeting' ||
+    pathname.startsWith('/meeting/') ||
     pathname.startsWith('/vendor/');
 
   app.use((req, res, next) => {
@@ -588,6 +642,17 @@ app.get('/meeting', (_req, res) => {
   res.type('html').send(MEETING_HTML);
 });
 
+/**
+ * 带会议 id 的地址（`/meeting/<id>`），和 ChatGPT 的 `/c/<uuid>` 一个意思：
+ * 可以直接分享、刷新、收藏，回来时自动打开那一场。
+ *
+ * 参数**收窄成 meeting- 前缀**：不然 `/meeting/runs` 这种子路由会被它抢走，
+ * 返回一页 HTML 而不是 JSON。
+ */
+app.get('/meeting/:id(meeting-[0-9a-f-]+)', (_req, res) => {
+  res.type('html').send(MEETING_HTML);
+});
+
 app.get('/health', async (_req, res) => {
   res.json({
     ok: true,
@@ -661,10 +726,21 @@ app.post('/meeting/plan', (req, res) => {
       summarizer: { alias: plan.summarizer.alias, provider: plan.summarizer.provider },
     });
   } catch (error) {
-    const message = error instanceof Error ? error.message : '计算会议计划失败';
+    const message = describeRequestError(error, '计算会议计划失败');
     res.status(400).json({ error: { message } });
   }
 });
+
+/**
+ * 统一的对外错误文案：Zod 校验错误翻成人话，其余原样带出。
+ * `/meeting/plan` 这类"入参不对"的路由用它，好过让用户对着一坨 JSON 猜。
+ */
+function describeRequestError(error: unknown, fallback: string): string {
+  if (error instanceof z.ZodError) {
+    return describeValidationError(error);
+  }
+  return error instanceof Error ? error.message : fallback;
+}
 
 app.get('/sessions', async (_req, res) => {
   res.json({
@@ -680,7 +756,7 @@ app.get('/providers/:provider', (req, res) => {
       provider: getProvider(provider),
     });
   } catch (error) {
-    const message = error instanceof Error ? error.message : 'provider 不存在';
+    const message = describeRequestError(error, 'provider 不存在');
     res.status(400).json({ error: { message } });
   }
 });
@@ -694,7 +770,7 @@ app.post('/providers/reload', (_req, res) => {
       providers: providers.map((provider) => provider.id),
     });
   } catch (error) {
-    const message = error instanceof Error ? error.message : '重载 selector 失败';
+    const message = describeRequestError(error, '重载 selector 失败');
     res.status(400).json({ error: { message } });
   }
 });
@@ -736,7 +812,7 @@ app.get('/session/:provider/inspect', async (req, res) => {
       ...payload,
     });
   } catch (error) {
-    const message = error instanceof Error ? error.message : '调试页面失败';
+    const message = describeRequestError(error, '调试页面失败');
     res.status(400).json({ error: { message } });
   }
 });
@@ -749,7 +825,7 @@ app.post('/session/:provider/probe-input', async (req, res) => {
     const payload = await browserManager.probeInputStrategies(provider, conversationId, probeText);
     res.json({ ok: true, provider, conversationId, ...payload });
   } catch (error) {
-    const message = error instanceof Error ? error.message : '探测输入框失败';
+    const message = describeRequestError(error, '探测输入框失败');
     res.status(400).json({ error: { message } });
   }
 });
@@ -767,6 +843,7 @@ app.post('/session/:provider/extract-latest', async (req, res) => {
       {
         take: (page, since) => browserManager.takeCapturedStream(page, provider, since),
         frames: (page, since) => browserManager.streamFrames(page, provider, since),
+        settled: (page, since) => browserManager.isStreamSettled(page, provider, since),
       },
       (page) => browserManager.bringPageToFront(page),
     );
@@ -840,6 +917,28 @@ app.post('/meetings', async (req, res) => {
   res.json({ meeting: record });
 });
 
+/**
+ * 某场会议当前跑得怎么样。
+ *
+ * 页面订阅 SSE 只是为了实时看进度，**不是**会议继续跑的前提条件。
+ * 用户切去控制台、去看别的会议记录、或者干脆关掉页面，会议都在服务端继续，
+ * 回来时用这个接口把进度和结果取回去。
+ *
+ * 注意这两条必须排在 `/meeting/:id` 前面。
+ */
+app.get('/meeting/runs', (_req, res) => {
+  res.json({ runs: listRunningRuns() });
+});
+
+app.get('/meeting/runs/:id', (req, res) => {
+  const run = getRun(req.params.id);
+  if (!run) {
+    res.status(404).json({ error: { message: '这场会议现在没有在跑。' } });
+    return;
+  }
+  res.json({ run });
+});
+
 app.get('/meetings/:id', async (req, res) => {
   const store = await meetingStore();
   const record = store.get(req.params.id);
@@ -877,6 +976,8 @@ app.delete('/meetings/:id', async (req, res) => {
 
 app.post('/v1/chat/completions', async (req, res) => {
   let effectiveMeetingConversationId: string | undefined;
+  // 出了错要能回写运行状态，所以把会议 id 提到外层。
+  let meetingRecordId: string | undefined;
 
   try {
     const payload = requestSchema.parse(req.body);
@@ -904,6 +1005,19 @@ app.post('/v1/chat/completions', async (req, res) => {
 
       const priorTranscript = store.transcriptOf(record.id);
 
+      // 同一场会议已经在跑就别再起一次，否则两边的发言会互相穿插。
+      if (isRunning(record.id)) {
+        res.status(409).json({
+          error: { message: '这场会议还在跑，等它跑完再发下一轮。' },
+        });
+        return;
+      }
+
+      // 进度记在服务端。页面订阅只是「看」：关掉页面、切去控制台、去翻别的会议，
+      // 会议照跑，跑完照样落库。回来时用 GET /meeting/runs/:id 取回进度。
+      startRun(record.id);
+      meetingRecordId = record.id;
+
       if (payload.stream) {
         res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
         res.setHeader('Cache-Control', 'no-cache, no-transform');
@@ -923,6 +1037,20 @@ app.post('/v1/chat/completions', async (req, res) => {
             onProgress: async (event) => {
               if (event.type === 'meeting.started') {
                 effectiveMeetingConversationId = event.meeting.conversationId;
+              } else if (event.type === 'meeting.entry' && event.entry) {
+                appendRunEntry(record.id, event.entry);
+              } else if (event.type === 'meeting.speaking') {
+                setRunSpeaking(record.id, event.speaker, event.provider, event.round);
+              } else if (event.type === 'meeting.delta' && event.contentDelta) {
+                // 增量也记进运行状态：用户中途关掉页面，回来时至少能看到
+                // 已经写出来的那一半，而不是一片空白。
+                appendRunDelta(
+                  record.id,
+                  event.speaker,
+                  event.provider,
+                  event.round,
+                  event.contentDelta,
+                );
               }
               writeSse(res, event);
             },
@@ -930,6 +1058,8 @@ app.post('/v1/chat/completions', async (req, res) => {
         );
 
         recordTurn(store, record.id, latestUserMessage, meetingResult);
+        finishRun(record.id, meetingResult?.choices?.[0]?.message?.content ?? '');
+        clearRun(record.id);
 
         // 总结按 OpenAI 形状补发成 chunk，这样按 chat/completions 解析的客户端
         // （包括控制台）能用同一条 delta 逻辑把它读出来。
@@ -957,11 +1087,15 @@ app.post('/v1/chat/completions', async (req, res) => {
           onProgress: async (event) => {
             if (event.type === 'meeting.started') {
               effectiveMeetingConversationId = event.meeting.conversationId;
+            } else if (event.type === 'meeting.entry' && event.entry) {
+              appendRunEntry(record.id, event.entry);
             }
           },
         },
       );
       recordTurn(store, record.id, latestUserMessage, meetingResponse);
+      finishRun(record.id, meetingResponse?.choices?.[0]?.message?.content ?? '');
+      clearRun(record.id);
       res.json(meetingResponse);
       return;
     }
@@ -1084,8 +1218,26 @@ app.post('/v1/chat/completions', async (req, res) => {
     });
   } catch (error) {
     await revealRelevantSessionOnError(req.body ?? {}, effectiveMeetingConversationId);
-    const message = error instanceof Error ? error.message : '请求失败';
-    const status = error instanceof z.ZodError ? 400 : 500;
+    // 中途失败也要留痕：页面重新打开时能看到"这场会议跑崩了"，而不是空白。
+    // meetingRecordId 只在会议路径里赋值。
+    if (meetingRecordId) {
+      const current = getRun(meetingRecordId);
+      if (current?.status === 'running') {
+        failRun(meetingRecordId, error instanceof Error ? error.message : '会议中断了');
+      }
+    }
+    const isValidation = error instanceof z.ZodError;
+    if (isValidation) {
+      logRejectedRequest('/v1/chat/completions', req.body, error);
+    }
+    // 校验失败要说人话。原来直接把 Zod 的 JSON 原文抛出去，前端只显示
+    // 「type error」，既不知道是哪个字段也不知道期望什么。
+    const message = isValidation
+      ? describeValidationError(error)
+      : error instanceof Error
+        ? error.message
+        : '请求失败';
+    const status = isValidation ? 400 : 500;
 
     if (req.body?.stream) {
       if (!res.headersSent) {

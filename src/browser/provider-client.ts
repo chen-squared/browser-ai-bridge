@@ -46,6 +46,17 @@ const STREAM_CAPTURE_WINDOW_MS = 30_000;
  */
 const STREAM_GRACE_AFTER_DOM_MS = 3_000;
 
+/**
+ * 错误是否表示"没抓到稳定回答"，也就是消息很可能压根没发出去。
+ *
+ * 这种情况下页面上任何看起来像答案的东西都不可信（通常是首屏问候语、
+ * 侧栏导航、输入框占位文字），所以要报错而不是回退去抓。
+ */
+function isPromptEchoLike(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error ?? '');
+  return /未能稳定提取 .*回复内容|未提取到 .*有效回复文本|未找到 .*回复节点/u.test(message);
+}
+
 const turndownService = new TurndownService({
   bulletListMarker: '-',
   codeBlockStyle: 'fenced',
@@ -578,6 +589,7 @@ export class ProviderClient {
     private readonly streamSource?: {
       take: (page: Page, since: number) => ReducedStream | undefined;
       frames: (page: Page, since: number) => AsyncGenerator<string, void, void>;
+      settled?: (page: Page, since: number) => boolean;
     },
     /**
      * 把页签切到前台。
@@ -648,13 +660,23 @@ export class ProviderClient {
     this.logPromptDebug(page, normalizedPrompt, options, prompt);
     await this.focusAndFill(page, provider, input, prompt);
     const streamSentAt = Date.now();
-    await this.submit(page, provider, input, existingResponseCount, page.url());
+    await this.submit(
+      page,
+      provider,
+      input,
+      existingResponseCount,
+      page.url(),
+      normalizedPrompt.latestUserMessage,
+    );
 
-    // 真流式：WebSocket 帧一到就往外推，拿到首字延迟。
-    // 仅当调用方要 delta、provider 是 websocket 传输、且确实配了 websocket 捕获时生效；
-    // 任何一步不满足就照旧走下面的 DOM 路径，功能不受影响。
-    if (options?.onDelta && provider.streamCapture?.transport === 'websocket') {
-      const live = await this.collectLiveDeltas(page, provider, streamSentAt, options.onDelta);
+    // 真流式：内容一到就往外推，拿到首字延迟。
+    //
+    // 两条路：WebSocket 是真帧流，直接迭代；HTTP 这五家走页内 hook
+    // （fetch 用 res.clone()、XHR 轮询 responseText），捕获条目边收边长，
+    // 这里轮询取差量推出去。任何一步不满足就照旧走 DOM 路径，功能不受影响。
+    const wantLiveDeltas = Boolean(options?.onDelta && provider.streamCapture);
+    if (wantLiveDeltas && provider.streamCapture?.transport === 'websocket') {
+      const live = await this.collectLiveDeltas(page, provider, streamSentAt, options!.onDelta!);
       if (live) {
         return {
           provider: this.providerId,
@@ -667,8 +689,6 @@ export class ProviderClient {
         };
       }
     }
-
-    const minimumResponseBlocks = 1;
 
     // 真流优先。正文与思考内容由协议里的 phase 字段区分，不必再从 DOM 里猜哪个块
     // 是答案（此前就因为抓错块把 DeepSeek 的思考过程当成了回复）。捕获不到就
@@ -683,6 +703,14 @@ export class ProviderClient {
         return undefined;
       }
       const captured = await this.awaitCapturedStream(page, streamSentAt);
+
+      // 站点在协议里明确报了错（配额用完、限流、需要登录…）就直接说明白。
+      // 这一步之前完全不存在：配额耗尽时站点**不给正文**只给错误事件，归约结果是空的，
+      // 于是流程一路退到 DOM，最后报成"未能稳定提取 XXX 的回复内容"。
+      if (captured?.error) {
+        throw new Error(captured.error);
+      }
+
       if (!captured?.content || isPlaceholderArtifactText(captured.content)) {
         return undefined;
       }
@@ -708,11 +736,38 @@ export class ProviderClient {
       };
     };
 
-    let responseTexts: string[];
-    // 两条路**同时**跑，谁先到谁说话。真流优先的言下之意就是"不用等 DOM"：
-    // 站点改版后 DOM 那条会拖很久（ChatGPT 实测要 30 秒才判定失败），
-    // 而真流 8 秒就有答案了。串行等待等于把两个耗时相加。
-    const streamTask = streamResult();
+    const minimumResponseBlocks = 1;
+
+    // 真流这一路会把"站点明确报的错"抛出来（配额用完之类）。它参与赛跑，
+    // 所以必须自己接住：否则 DOM 那一路先到时，这里就变成一个没人理的
+    // unhandled rejection。记下来，等要报的时候再抛。
+    let streamFailure: Error | undefined;
+
+    // 已经往客户端推过增量了吗？推过就不能让 DOM 的结果覆盖——DOM 抽取常常只拿到
+    // 回答的尾巴加上页脚免责声明（实测 deepseek 返回过
+    // 「…本回答由 AI 生成，内容仅供参考，请仔细甄别」）。
+    let pushedDelta = false;
+    const guardedOnDelta = (delta: LiveDelta): void => {
+      if (delta.contentDelta || delta.reasoningDelta) {
+        pushedDelta = true;
+      }
+      options!.onDelta!(delta);
+    };
+
+    // 页内 hook 的逐帧下推不是一道阻塞闸门，而是和 DOM 赛跑的一路。
+    const streamTask = (
+      wantLiveDeltas &&
+      provider.streamCapture?.inPageCapture &&
+      provider.streamCapture.transport === 'http'
+        ? this.collectPolledDeltas(page, provider, streamSentAt, guardedOnDelta).then((reduced) =>
+            reduced ? this.toChatResult(reduced) : undefined,
+          )
+        : streamResult()
+    ).catch((error: unknown) => {
+      streamFailure = error instanceof Error ? error : new Error(String(error));
+      return undefined;
+    });
+
     const domTask = this.waitForStableResponses(
       page,
       provider,
@@ -730,14 +785,37 @@ export class ProviderClient {
         ({ ok: false, error }) as { ok: true; texts: string[] } | { ok: false; error: unknown },
     );
 
-    const first = await Promise.race([
-      streamTask.then((result) => ({ source: 'stream' as const, result })),
-      domTask.then((outcome) => ({ source: 'dom' as const, outcome })),
-    ]);
+    // `stream:true` 时**以协议捕获为准，DOM 不参与赛跑**。
+    //
+    // 跟页内 hook 无关：长回答时 DOM 的"连续三轮不变"会在正文出现之前就判稳
+    // （deepseek 先出思考块、停顿几秒、正文后到），于是 DOM 抢先赢下赛跑，
+    // 交上来的是回答的尾巴加页脚免责声明。
+    const streamOnly = wantLiveDeltas && provider.streamCapture?.transport === 'http';
+
+    let responseTexts: string[];
+
+    const first = streamOnly
+      ? { source: 'stream' as const, result: await streamTask }
+      : await Promise.race([
+          streamTask.then((result) => ({ source: 'stream' as const, result })),
+          domTask.then((outcome) => ({ source: 'dom' as const, outcome })),
+        ]);
+
+    if (first.source === 'dom' && pushedDelta) {
+      // 已经推过增量，就等真流收尾，绝不用 DOM 的残缺尾巴去覆盖。
+      const fromStream = await streamTask;
+      if (fromStream) {
+        return fromStream;
+      }
+    }
 
     if (first.source === 'stream') {
       if (first.result) {
         return first.result;
+      }
+      // 站点明确报了错（配额用完等）：这条比 DOM 可靠，直接说明白。
+      if (streamFailure) {
+        throw streamFailure;
       }
       // 流等满窗口没拿到内容，接着走 DOM。
       const outcome = await domTask;
@@ -753,8 +831,33 @@ export class ProviderClient {
       if (fromStream) {
         return fromStream;
       }
+      if (streamFailure) {
+        throw streamFailure;
+      }
+      // 流也拿不到，而且 DOM 还说"没稳定"。**刷新一次页面再从 DOM 找一次。**
+      //
+      // 站点那边其实已经把这轮回答存下来了，只是页面没渲染出来——ChatGPT 就是
+      // 这样：回答在，重新加载一次它就出现了。这时候 DOM 重试能救回来。
+      //
+      // 但**绝不能**在没刷新之前去页面上随便抓一块：消息可能压根没发出去，
+      // 抓回来的会是首屏问候语（Claude 并发时返回过 `How can I help you today?`）。
+      if (isPromptEchoLike(first.outcome.error)) {
+        const recovered = await this.retryFromReloadedPage(page, provider, prompt);
+        if (recovered) {
+          return recovered;
+        }
+        throw new Error(
+          `${this.providerId} 没能确认这一轮是否真的发出去了，也没抓到任何回答；` +
+            `刷新页面重试也没有找到。为避免把页面上的无关文字当成本轮答案，这里直接报错。请重发一次。`,
+        );
+      }
       throw first.outcome.error;
     } else {
+      // DOM 先好了，但先看看站点是不是明确报过错——配额耗尽时 DOM 里常有
+      // 一句"已达上限"，那种情况返回它比返回页面上的残缺正文有用。
+      if (streamFailure) {
+        throw streamFailure;
+      }
       responseTexts = first.outcome.texts;
       // DOM 先好了，但真流仍是权威：给它一小段宽限期，到点就用手上的 DOM 结果。
       // 不设上限地等流，会在流彻底没来的时候白等满整个窗口。
@@ -1006,6 +1109,91 @@ export class ProviderClient {
    * 完成判定用的是帧里的权威 `response.done`，而不是 DOM 的"连续三轮内容不变"——
    * 后者是为轮询设计的启发式，对流式通道既慢又不可靠。
    */
+  /** 把真流归约结果包成对外的返回结构（和 WebSocket 那条保持同一形状）。 */
+  private toChatResult(reduced: ReducedStream): ChatResult {
+    return {
+      provider: this.providerId,
+      url: '',
+      capturedFromStream: true,
+      ...(reduced.reasoningContent ? { reasoningContent: reduced.reasoningContent } : {}),
+      ...(reduced.usage ? { usage: reduced.usage } : {}),
+      debug: { extraction: { items: [...this.extractionDebugItems] } },
+      content: reduced.content,
+    };
+  }
+
+  /**
+   * 轮询式下推：给 HTTP provider 用的那条路。
+   *
+   * WebSocket 是真帧流，`collectLiveDeltas` 直接迭代就行；HTTP 这五家靠页内 hook
+   * （见 `inpage-hook.ts`）——它把响应逐块并进捕获条目，条目长度**边收边长**，
+   * 所以这里轮询取差量来推，首字延迟不再等于整条回答的时长。
+   *
+   * **差量怎么算**：各家协议形态不一样——Claude / ChatGPT / DeepSeek / Qwen 是
+   * 只追加，Gemini 是每帧累积快照。两者都能用同一条规则：新内容只要以上次推出去的
+   * 那段为开头，就推多出来的部分。万一不是纯追加（文本被改写）就不推——
+   * 推了客户端也撤不回来，反正最终结果是以完整归约为准的。
+   */
+  private async collectPolledDeltas(
+    page: Page,
+    provider: ReturnType<typeof getProvider>,
+    since: number,
+    onDelta: (delta: LiveDelta) => void,
+  ): Promise<ReducedStream | undefined> {
+    const startedAt = Date.now();
+    let pushed = '';
+    let sawContent = false;
+    let grewAt = 0;
+
+    for (;;) {
+      const captured = this.streamSource?.take(page, since);
+      if (captured?.error) {
+        throw new Error(captured.error);
+      }
+
+      if (captured?.content && captured.content.length > pushed.length) {
+        if (captured.content.startsWith(pushed)) {
+          onDelta({ contentDelta: captured.content.slice(pushed.length) });
+          pushed = captured.content;
+          grewAt = Date.now();
+          if (!sawContent) {
+            sawContent = true;
+            this.extractionDebugItems.push({
+              index: 0,
+              method: 'html',
+              detail: '正文来自页内 hook 逐块递出的协议流，未从 DOM 推断',
+              preview: captured.content.slice(0, 180),
+            });
+          }
+        }
+      }
+
+      // 收工要看**传输层**的收尾信号，不能看归约器的 finished——
+      // Gemini / Claude 的归约器是无条件 finished:true 的（"取最后一份完整快照"），
+      // 增量下推时第一份能解析出字的中间快照就会触发它，于是刚出两个字就收工。
+      if (captured?.content && this.streamSource?.settled?.(page, since)) {
+        return captured;
+      }
+
+      const elapsed = Date.now() - startedAt;
+      // 出过字之后长时间不再增长就收工。ChatGPT 的 SSE **永远等不到 eof**
+      // （实测读完 body 也拿不到 finished），干等下去只会把整条回答的延迟全部吐掉。
+      if (sawContent && grewAt > 0 && Date.now() - grewAt > 3_000) {
+        return captured;
+      }
+      // 一个字都没有时不自己下判断——赛跑里还有 DOM 那一路，让它去比。
+      // 只保留一个兜底上限，免得 hook 压根没装上时永远挂着。
+      if (!sawContent && elapsed > 45_000) {
+        return undefined;
+      }
+      if (elapsed > (provider.maxGenerationTimeoutMs ?? 600_000)) {
+        return sawContent ? captured : undefined;
+      }
+
+      await page.waitForTimeout(120);
+    }
+  }
+
   private async collectLiveDeltas(
     page: Page,
     provider: ReturnType<typeof getProvider>,
@@ -1080,6 +1268,10 @@ export class ProviderClient {
     let last: ReturnType<NonNullable<typeof this.streamSource>['take']>;
     for (;;) {
       const captured = this.streamSource?.take(page, since);
+      // 站点明确报了错就立刻返回，别再空等整个窗口——错误不会再变成内容。
+      if (captured?.error) {
+        return captured;
+      }
       if (captured?.content) {
         last = captured;
         // **拿到内容不等于拿到完整内容。** HTTP 的 body 只有响应结束后才完整，
@@ -1206,28 +1398,38 @@ export class ProviderClient {
     return normalizedPrompt.latestUserMessage;
   }
 
+  /**
+   * 把 system + 历史 + 当前请求拼成一段文本（网页只有一个输入框，没有真正的多轮）。
+   *
+   * 空的段落整段不出现。原先无论有没有内容都硬写上 `Response rules: (none)` /
+   * `History: (none)` / `Current request:`——那三行对模型是纯噪音：它会当成一份
+   * 结构化任务清单来接，于是说话腔调都变了。会议模式尤其明显，它自己已经把
+   * 「问题 + 各位说过的话」拼成完整的一段了，外面再套一层框只剩干扰。
+   */
   private buildStructuredPrompt(
     system: string | undefined,
     historyMessages: Array<{ role: 'user' | 'assistant'; content: string; name?: string }>,
     currentRequest: string,
   ): string {
-    const lines: string[] = ['Response rules:', system?.trim() || '(none)', '', 'History:'];
+    const systemText = system?.trim();
+    const parts: string[] = [];
 
-    if (historyMessages.length === 0) {
-      lines.push('(none)');
-    } else {
-      for (const message of historyMessages) {
-        const speakerLabel = message.name ? ` speaker=${message.name}` : '';
-        lines.push(`- role=${message.role}${speakerLabel}`);
-        lines.push(message.content);
-      }
+    if (systemText) {
+      parts.push(systemText);
     }
 
-    lines.push('');
-    lines.push('Current request:');
-    lines.push(currentRequest);
+    if (historyMessages.length > 0) {
+      const history: string[] = ['History:'];
+      for (const message of historyMessages) {
+        const speakerLabel = message.name ? ` speaker=${message.name}` : '';
+        history.push(`- role=${message.role}${speakerLabel}`);
+        history.push(message.content);
+      }
+      parts.push(history.join('\n'));
+    }
 
-    return lines.join('\n');
+    parts.push(currentRequest);
+    return parts.join('\n\n');
   }
 
   private logPromptDebug(
@@ -1359,28 +1561,31 @@ export class ProviderClient {
     }
 
     const currentUrl = page.url();
-    const currentTitle = await page.title().catch(() => '');
-    const hasExpectedUrl = this.matchesExpectedUrl(currentUrl, provider);
-    const hasExpectedTitle = this.matchesExpectedTitle(currentTitle, provider);
-    const hasVisibleInput = await this.hasAnyVisibleCandidate(page, provider.inputSelectors);
 
-    if (hasExpectedUrl && (hasVisibleInput || hasExpectedTitle)) {
+    // **输入框可见才算就绪。**
+    //
+    // 原来这里是 `hasVisibleInput || hasExpectedTitle`：标题先加载、页面还没
+    // 渲染完输入框时就直接放行，于是往空白页里发消息。症状是
+    // `locator.focus: Timeout 30000ms exceeded`（Gemini）或者发送根本没发生、
+    // 后面从页面上抓到的是首屏问候语而不是回答（Claude）。
+    //
+    // 宁可多等，也不要往没准备好的页面里打字。
+    const ready = await this.waitForComposerReady(page, provider);
+    if (ready) {
       return;
     }
 
-    await page.goto(provider.url, { waitUntil: 'domcontentloaded' });
-    await page.waitForTimeout(800);
+    await page.goto(provider.url, { waitUntil: 'domcontentloaded' }).catch(() => undefined);
 
     if (this.providerId === 'grok') {
       await this.tryPrepareGrokComposer(page);
     }
 
-    const recoveredInput = await this.hasAnyVisibleCandidate(page, provider.inputSelectors);
-    if (recoveredInput) {
+    if (await this.waitForComposerReady(page, provider)) {
       return;
     }
 
-    const blockingState = await this.detectBlockingPageState(page, provider, recoveredInput);
+    const blockingState = await this.detectBlockingPageState(page, provider, false);
     if (blockingState) {
       throw new Error(blockingState);
     }
@@ -1396,6 +1601,92 @@ export class ProviderClient {
     throw new Error(
       `当前 ${this.providerId} 页签看起来不在可发送状态，已尝试恢复但仍未找到输入框。title=${recoveredTitle || '<empty>'}, url=${recoveredUrl || currentUrl || '<empty>'}`,
     );
+  }
+
+  /**
+   * 等输入框可用。返回是否等到。
+   *
+   * 这些站点都是重 SPA：`domcontentloaded` 只说明 HTML 到了，React 还什么都没
+   * 挂上。原来导航完固定等 800ms 就开始找输入框，慢一点就扑空。
+   */
+  private async waitForComposerReady(page: Page, provider: ProviderConfig): Promise<boolean> {
+    const timeoutMs = provider.readyTimeoutMs ?? 30_000;
+    const startedAt = Date.now();
+
+    for (;;) {
+      if (page.isClosed()) {
+        return false;
+      }
+      if (await this.hasAnyVisibleCandidate(page, provider.inputSelectors)) {
+        return true;
+      }
+      // 一开始的几秒更积极地等；后面退到 500ms 一次，别把 CPU 全花在轮询上。
+      await page.waitForTimeout(Date.now() - startedAt < 5_000 ? 150 : 500);
+      if (Date.now() - startedAt >= timeoutMs) {
+        return false;
+      }
+    }
+  }
+
+  /**
+   * 刷新页面后再从 DOM 找一次答案。
+   *
+   * 用于"站点那边其实已经答了，但页面没渲染出来"的情况——ChatGPT 遇到过一次，
+   * 必须刷新页面才出现那条回答。刷新后回答会从服务端会话历史里加载回来，
+   * 于是 DOM 抽取就能拿到。
+   *
+   * 返回 undefined 表示刷新完还是没找到，交给上层报错。
+   */
+  private async retryFromReloadedPage(
+    page: Page,
+    provider: ProviderConfig,
+    prompt: string,
+  ): Promise<ChatResult | undefined> {
+    try {
+      await page.reload({ waitUntil: 'domcontentloaded', timeout: 60_000 });
+      await page.waitForTimeout(1500);
+      if (!(await this.waitForComposerReady(page, provider))) {
+        return undefined;
+      }
+
+      const texts = await this.waitForStableResponses(
+        page,
+        provider,
+        // 刷新后这一轮的回答已经在页面上了，所以基线取 0：只要有可见的回答块
+        // 就算数，取最后一个。
+        0,
+        undefined,
+        1,
+        { latestUserMessage: '', fullPrompt: prompt },
+      ).catch(() => []);
+
+      const usable = texts.filter(
+        (text) =>
+          text &&
+          !this.isPromptEcho(text, '', prompt) &&
+          !this.isProviderErrorText(text) &&
+          !isPlaceholderArtifactText(text),
+      );
+      if (usable.length === 0) {
+        return undefined;
+      }
+
+      const recovered = usable[usable.length - 1];
+      this.extractionDebugItems.push({
+        index: 0,
+        method: 'html',
+        detail: '流与 DOM 都没抓到，刷新页面后从历史里取回了这一轮的回答',
+        preview: recovered.slice(0, 180),
+      });
+      return {
+        provider: this.providerId,
+        url: page.url(),
+        debug: { extraction: { items: [...this.extractionDebugItems] } },
+        ...this.extractChatResult([recovered]),
+      };
+    } catch {
+      return undefined;
+    }
   }
 
   private async prepareComposerForInput(page: Page, provider: ProviderConfig): Promise<void> {
@@ -1503,11 +1794,13 @@ export class ProviderClient {
 
         if (tagName === 'textarea' || tagName === 'input') {
           await this.fillTextInput(page, provider, currentInput, prompt);
+          await this.assertComposerHasText(page, provider, prompt, attempt);
           return;
         }
 
         if (isContentEditable) {
-          await this.fillContentEditable(page, currentInput, prompt);
+          await this.fillContentEditable(page, provider, currentInput, prompt);
+          await this.assertComposerHasText(page, provider, prompt, attempt);
           return;
         }
 
@@ -1526,6 +1819,66 @@ export class ProviderClient {
     }
 
     throw lastError ?? new Error('未能写入输入框');
+  }
+
+  /**
+   * 发送按钮有没有被"有内容"激活。
+   *
+   * 找不到可见按钮时返回 true —— 有些站点一直显示一个禁用按钮，靠 aria-label
+   * 之类的属性判断容易误伤，这时宁可放行给后面的发送逻辑去处理。
+   */
+  private async isSendReady(page: Page, provider: ProviderConfig): Promise<boolean> {
+    for (const selector of provider.sendButtonSelectors) {
+      const button = await this.findVisibleCandidate(page.locator(selector));
+      if (!button) {
+        continue;
+      }
+      try {
+        if (await button.isEnabled()) {
+          return true;
+        }
+      } catch {
+        return true;
+      }
+    }
+    return true;
+  }
+
+  /**
+   * 填完回读一次，确认字真的落进了输入框。
+   *
+   * 之前 fill 完就直接去点发送，于是有一类失败完全看不出原因：字压根没进去，
+   * 点发送是空点，页面什么都不发生，最后报"未能稳定提取回复内容"。
+   * 诊断里 `输入框内容: (空)` 就是它。
+   *
+   * contenteditable（Gemini 的 ProseMirror、Claude 的 tiptap）尤其容易这样——
+   * 站点可能在填充过程中重渲染编辑器，把内容吃掉。
+   * 这里验证不过就抛出去，交给外层重新定位元素再填一遍。
+   */
+  private async assertComposerHasText(
+    page: Page,
+    provider: ProviderConfig,
+    prompt: string,
+    attempt: number,
+  ): Promise<void> {
+    const tail = prompt.trim().slice(-16);
+    if (tail.length < 4) {
+      return;
+    }
+    const current = await this.readComposerText(page, provider);
+    if (current.includes(tail)) {
+      return;
+    }
+    // 贴到屏幕上了就算了，别为了凑验证把提示词重复一遍。
+    const onPage = await page
+      .locator('body')
+      .innerText({ timeout: 2000 })
+      .then((text) => text.includes(tail))
+      .catch(() => false);
+    if (onPage) {
+      return;
+    }
+    throw new Error(`第 ${attempt + 1} 次填充后输入框里没有提示词（读到 ${current}）`);
   }
 
   private async fillTextInput(
@@ -1638,23 +1991,46 @@ export class ProviderClient {
     }
   }
 
-  private async fillContentEditable(page: Page, input: Locator, prompt: string): Promise<void> {
+  private async fillContentEditable(
+    page: Page,
+    provider: ProviderConfig,
+    input: Locator,
+    prompt: string,
+  ): Promise<void> {
+    // 注意每一层都要**两个条件**都满足才算成功：输入框里看得到字，**并且**
+    // 发送按钮被激活了。
+    //
+    // 只看字是不够的：Playwright 的 `fill()` 对 contenteditable 是直接改
+    // textContent，DOM 上确实有字，但 ProseMirror / tiptap 这类编辑器
+    // **内部状态并不会跟着更新**，App 仍然认为输入框是空的——发送按钮保持
+    // 禁用，或者点了也是空点。实测 Gemini 栽在这里：页面上什么都没有发生，
+    // URL 也没变成会话地址，而回读输入框却是"有字"的。
+    //
+    // 按钮被激活这条信号只有 App 自己知道，正好用来区分"字进了 DOM"和
+    // "字进了 App 的状态"。
     try {
       await input.fill('');
       await input.fill(prompt);
-      if (await this.contentEditableContainsText(input, prompt)) {
+      if (
+        (await this.contentEditableContainsText(input, prompt)) &&
+        (await this.isSendReady(page, provider))
+      ) {
         return;
       }
     } catch {
       // Fall through to keyboard/DOM fallback when native fill is not accepted.
     }
 
+    // 逐字输入能真正驱动编辑器的内部状态，比 fill 慢但可靠。
     try {
       await input.focus();
       await input.press('ControlOrMeta+A');
       await input.press('Backspace');
       await page.keyboard.insertText(prompt);
-      if (await this.contentEditableContainsText(input, prompt)) {
+      if (
+        (await this.contentEditableContainsText(input, prompt)) &&
+        (await this.isSendReady(page, provider))
+      ) {
         return;
       }
     } catch {
@@ -1768,6 +2144,7 @@ export class ProviderClient {
     input: Locator,
     previousResponseCount: number,
     previousUrl: string,
+    latestUserMessage: string,
   ): Promise<void> {
     // signalTimeoutMs: how long to wait after each send attempt for a confirmation signal.
     const signalTimeoutMs = provider.submissionSignalTimeoutMs ?? 8000;
@@ -1782,20 +2159,22 @@ export class ProviderClient {
           if (await button.isEnabled()) {
             await button.click({ timeout: 5000 });
             buttonClickFired = true;
-            if (
-              await this.waitForSubmissionSignal(
-                page,
-                provider,
-                input,
-                previousResponseCount,
-                previousUrl,
-                signalTimeoutMs,
-              )
-            ) {
+            const verdict = await this.waitForSubmissionSignal(
+              page,
+              provider,
+              previousResponseCount,
+              previousUrl,
+              signalTimeoutMs,
+              latestUserMessage,
+            );
+            if (verdict === 'confirmed') {
               return;
             }
-            // Button clicked but confirmation timed out.
-            // Break immediately—do NOT try the next selector to prevent double-sending.
+            // 字还留在输入框里 = 压根没发出去，换个选择器重试是安全的。
+            if (verdict === 'not-sent') {
+              continue;
+            }
+            // 说不清发没发出去，不重试，避免双发。
             break;
           }
         } catch {
@@ -1812,19 +2191,18 @@ export class ProviderClient {
           if (await heuristicButton.isEnabled()) {
             await heuristicButton.click({ timeout: 5000 });
             buttonClickFired = true;
-            if (
-              await this.waitForSubmissionSignal(
-                page,
-                provider,
-                input,
-                previousResponseCount,
-                previousUrl,
-                signalTimeoutMs,
-              )
-            ) {
+            const verdict = await this.waitForSubmissionSignal(
+              page,
+              provider,
+              previousResponseCount,
+              previousUrl,
+              signalTimeoutMs,
+              latestUserMessage,
+            );
+            if (verdict === 'confirmed') {
               return;
             }
-            // Same: stop here to avoid double-sending via keyboard fallback.
+            // 同样：没发出去就继续走键盘回退，发没发不清就不动。
           }
         } catch {
           // Fall through to keyboard-based submission.
@@ -1848,6 +2226,7 @@ export class ProviderClient {
           previousResponseCount,
           previousUrl,
           signalTimeoutMs,
+          latestUserMessage,
         )
       ) {
         return;
@@ -1862,14 +2241,14 @@ export class ProviderClient {
       await input.focus();
       await input.press('Enter');
       if (
-        await this.waitForSubmissionSignal(
+        (await this.waitForSubmissionSignal(
           page,
           provider,
-          input,
           previousResponseCount,
           previousUrl,
           signalTimeoutMs,
-        )
+          latestUserMessage,
+        )) === 'confirmed'
       ) {
         return;
       }
@@ -1894,20 +2273,21 @@ export class ProviderClient {
     previousResponseCount: number,
     previousUrl: string,
     signalTimeoutMs: number,
+    latestUserMessage: string,
   ): Promise<boolean> {
     for (const shortcut of shortcuts) {
       try {
         await input.focus();
         await input.press(shortcut);
         if (
-          await this.waitForSubmissionSignal(
+          (await this.waitForSubmissionSignal(
             page,
             provider,
-            input,
             previousResponseCount,
             previousUrl,
             signalTimeoutMs,
-          )
+            latestUserMessage,
+          )) === 'confirmed'
         ) {
           return true;
         }
@@ -1924,55 +2304,123 @@ export class ProviderClient {
   private async waitForSubmissionSignal(
     page: Page,
     provider: ProviderConfig,
-    input: Locator,
     previousResponseCount: number,
     previousUrl: string,
     timeoutMs: number,
-  ): Promise<boolean> {
+    latestUserMessage: string,
+  ): Promise<'confirmed' | 'not-sent' | 'unknown'> {
     const startedAt = Date.now();
+
+    // 分清三件事，结论完全不一样：
+    //
+    // - confirmed：消息确实发出去了（回答块出现 / 页面转忙 / URL 变了 / 提示词进了气泡）
+    // - not-sent：字还老老实实躺在输入框里 = **压根没发出去**，重试是安全的
+    // - unknown：输入框空了，但提示词也不在页面上——可能是编辑器重渲染把字吃了
+    //   （Gemini 的 ProseMirror 实测会这样），也可能是发了但气泡还没渲染。
+    //   分不清，所以不重试，免得双发。
+    //
+    // 早先这里只有 true/false 两态，not-sent 和 unknown 混在一起，
+    // 结果就是"没发出去"也直接放弃，用户看着空白的页面干等。
 
     while (Date.now() - startedAt < timeoutMs) {
       if (page.url() !== previousUrl) {
-        return true;
+        return 'confirmed';
       }
 
       if (await this.isBusy(page, provider)) {
-        return true;
+        return 'confirmed';
       }
 
       if ((await this.countResponses(page, provider)) > previousResponseCount) {
-        return true;
+        return 'confirmed';
       }
 
-      if (await this.isInputCleared(input)) {
-        return true;
+      if (await this.isInputCleared(page, provider.inputSelectors)) {
+        if (await this.isPromptEchoVisible(page, provider, latestUserMessage)) {
+          return 'confirmed';
+        }
+        await page.waitForTimeout(150);
+        continue;
+      }
+
+      // 字还在输入框里跑了两轮都没动静：确定没发出去。
+      if (Date.now() - startedAt > timeoutMs / 2) {
+        return 'not-sent';
       }
 
       await page.waitForTimeout(150);
     }
 
-    return false;
+    return 'not-sent';
   }
 
-  private async isInputCleared(input: Locator): Promise<boolean> {
+  /**
+   * 输入框是不是已经空了（= 大概率已经发出去了）。
+   *
+   * **必须每次按选择器重新定位，不能复用旧句柄。** 输入框是 contenteditable
+   * （Grok / Claude 都是），站点提交后会重建它，旧句柄随即失效，
+   * `evaluate` 抛异常而这里 catch 成 false——于是"输入框已清空"这个本该立刻
+   * 成立的提交信号永远不成立，最后报成"未能确认提交成功"。
+   * 实测就是这个：消息明明已经发出去、Grok 也回话了，程序却等满 15 秒说失败。
+   */
+  /**
+   * 提示词是否已经作为**用户消息**出现在页面上。
+   *
+   * 只看正文区，不看输入框——输入框里本来就有这段字，那不算发出去。
+   * 取尾部一截来比：开头的几个字可能在气泡里有格式（Markdown、引用），
+   * 尾部更稳定。
+   */
+  private async isPromptEchoVisible(
+    page: Page,
+    provider: ProviderConfig,
+    latestUserMessage: string,
+  ): Promise<boolean> {
+    const tail = latestUserMessage.trim().slice(-24);
+    if (tail.length < 4) {
+      // 提示词太短时不敢拿它当证据，退回"只要输入框空了就算"。
+      return true;
+    }
     try {
-      return await input.evaluate((node) => {
-        const element = node as HTMLElement & { value?: string };
-        const tagName = element.tagName.toLowerCase();
-
-        if (tagName === 'textarea' || tagName === 'input') {
-          return !(element.value || '').trim();
-        }
-
-        if (element.isContentEditable) {
-          return !(element.innerText || element.textContent || '').trim();
-        }
-
+      const text = await page.locator('body').innerText({ timeout: 3000 });
+      if (!text.includes(tail)) {
         return false;
-      });
+      }
+      // 字还留在输入框里就不算——那是我们刚自己填进去的。
+      // 不排掉这一条的话，"提示词出现在页面上"在发送**之前**就成立，
+      // 于是提交确认永远是假阳性（实测 gemini 压根没发却被判成已发）。
+      const composer = await this.readComposerText(page, provider);
+      return !composer.includes(tail);
     } catch {
       return false;
     }
+  }
+
+  private async isInputCleared(page: Page, inputSelectors: readonly string[]): Promise<boolean> {
+    for (const selector of inputSelectors) {
+      const candidate = await this.findVisibleCandidate(page.locator(selector));
+      if (!candidate) {
+        continue;
+      }
+      try {
+        const cleared = await candidate.evaluate((node) => {
+          const element = node as HTMLElement & { value?: string };
+          const tagName = element.tagName.toLowerCase();
+          if (tagName === 'textarea' || tagName === 'input') {
+            return !(element.value || '').trim();
+          }
+          if (element.isContentEditable) {
+            return !(element.innerText || element.textContent || '').trim();
+          }
+          return false;
+        });
+        if (cleared) {
+          return true;
+        }
+      } catch {
+        // 这个候选点不可用了，继续试下一个。
+      }
+    }
+    return false;
   }
 
   /**
@@ -2178,7 +2626,96 @@ export class ProviderClient {
       }
     }
 
-    throw new Error(lastFastFailMessage ?? `未能稳定提取 ${this.providerId} 的回复内容`);
+    // 失败时把页面状态一并带出去。
+    //
+    // 光一句"未能稳定提取"什么都判断不出来：到底是消息压根没发出去、发了但站点
+    // 没回、还是回了但答案块出现在我们没覆盖的选择器里——每次都得靠猜。
+    // 这几项证据能把三种情况一眼分开。
+    const state = await this.describePageStateOnFailure(page, provider);
+    throw new Error(
+      `${lastFastFailMessage ?? `未能稳定提取 ${this.providerId} 的回复内容`}\n${state}`,
+    );
+  }
+
+  /**
+   * 收集失败当下的页面状态，拼成一段可以直接看的诊断。
+   *
+   * 只读、不改页面；任何一步出错都吞掉，绝不能让诊断本身把原始错误顶掉。
+   */
+  private async describePageStateOnFailure(page: Page, provider: ProviderConfig): Promise<string> {
+    const line = async (label: string, fn: () => string | Promise<string>): Promise<string> => {
+      try {
+        return `  ${label}: ${await fn()}`;
+      } catch (error) {
+        return `  ${label}: <取不到：${String(error).slice(0, 40)}>`;
+      }
+    };
+
+    return [
+      `[${provider.id} 失败时的页面状态]`,
+      await line('URL', () => page.url()),
+      await line('标题', async () => ((await page.title()) || '(空)').slice(0, 60)),
+      await line('回答块数', async () => String(await this.countResponses(page, provider))),
+      await line('抓到的候选文本数', async () =>
+        String(await this.countCandidateTexts(page, provider)),
+      ),
+      await line('输入框内容', () => this.readComposerText(page, provider)),
+      await line('页面上的提示', () => this.readVisibleNotices(page)),
+      await line('是否转圈', async () => ((await this.isBusy(page, provider)) ? '是' : '否')),
+    ].join('\n');
+  }
+
+  /** 输入框里现在还留着什么（判断"压根没发出去"最直接的证据）。 */
+  private async readComposerText(page: Page, provider: ProviderConfig): Promise<string> {
+    for (const selector of provider.inputSelectors) {
+      const candidate = await this.findVisibleCandidate(page.locator(selector));
+      if (!candidate) {
+        continue;
+      }
+      const text = await candidate.evaluate((node) => {
+        const element = node as HTMLInputElement;
+        return element.isContentEditable
+          ? element.innerText || element.textContent || ''
+          : element.value || '';
+      });
+      const trimmed = (text || '').trim().replace(/\s+/g, ' ');
+      if (trimmed) {
+        return JSON.stringify(trimmed.slice(0, 80));
+      }
+    }
+    return '(空)';
+  }
+
+  /**
+   * 页面上可见的提示语：容量不足、人机验证、限流这些。
+   *
+   * 站点把这类提示当普通气泡渲染，DOM 抽取会把它当成答案；这里单列出来，
+   * 免得下次又把它当成"回答内容缺失"去查错方向。
+   */
+  private async readVisibleNotices(page: Page): Promise<string> {
+    const notices = await page
+      .locator('[role="alert"], [role="status"], .notice, [class*="error"], [class*="warning"]')
+      .evaluateAll((nodes) =>
+        nodes
+          .map((node) => (node as HTMLElement).innerText?.trim() ?? '')
+          .filter((text) => text && text.length < 120)
+          .slice(0, 3)
+          .join(' / '),
+      )
+      .catch(() => '');
+    return notices || '(无)';
+  }
+
+  /** 按各 provider 的选择器各数一遍可见候选文本块，用来判断"回了但我们没抓到"。 */
+  private async countCandidateTexts(page: Page, provider: ProviderConfig): Promise<number> {
+    let total = 0;
+    for (const selector of provider.responseSelectors ?? []) {
+      total += await page
+        .locator(selector)
+        .count()
+        .catch(() => 0);
+    }
+    return total;
   }
 
   private async resolveUpdatedResponseSelector(
@@ -4388,6 +4925,20 @@ export class ProviderClient {
       'error in the message stream',
       'something went wrong',
       '出了点问题',
+      // 站点把"限流/容量不足"当成一条**正常的助手消息**发出来，DOM 抽取会
+      // 老老实实把它当答案交上来，用户看到的是一段"服务繁忙"而不是自己的答案。
+      // 各家措辞不同，实测到的：Grok「需求量高 / 当前使用人数较多」、
+      // Qwen「There was an issue connecting to … / 目前服务访问量较大」。
+      '需求量高',
+      '当前使用人数较多',
+      '使用人数较多',
+      '请稍后再试',
+      '稍后再试',
+      '服务访问量较大',
+      '服务繁忙',
+      '访问人数较多',
+      'issue connecting to',
+      'currently experiencing high',
       'network error',
       '网络错误',
       'internalerror.algo',
