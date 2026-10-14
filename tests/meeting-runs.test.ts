@@ -140,5 +140,36 @@ describe('会议后台运行状态', () => {
       assert.equal(appendRunDelta('meeting-1', 'grok1', 'grok', 1, '迟到的'), false);
       assert.equal(getRun('meeting-1')?.entries.length, 0);
     });
+
+    it('总结的增量记成 summary，不污染 discussion', () => {
+      // 之前 appendRunDelta 写死 stage='discussion'，总结 round:0 的增量会先占一条
+      // discussion，之后真正的 summary entry 落下来时两者并存，时间线里多一条幽灵。
+      startRun('meeting-1');
+      appendRunDelta('meeting-1', '总结者', 'claude', 0, '大家说', 'summary');
+      appendRunEntry('meeting-1', {
+        role: 'assistant',
+        speaker: '总结者',
+        provider: 'claude',
+        stage: 'summary',
+        round: 0,
+        content: '大家说的都很好。',
+      });
+
+      const run = getRun('meeting-1');
+      assert.equal(run?.entries.length, 1);
+      assert.equal(run?.entries[0].stage, 'summary');
+      assert.match(run?.entries[0].content ?? '', /都很好。$/);
+    });
+  });
+
+  it('挤满时只挤掉已结束的，正在跑的不能丢', () => {
+    // 之前 evictOldest 不看状态，running 也可能被 40 条上限挤掉，进度凭空消失。
+    startRun('meeting-hot');
+    for (let i = 0; i < 45; i += 1) {
+      startRun(`meeting-old-${i}`);
+      finishRun(`meeting-old-${i}`, '好了');
+    }
+    assert.equal(isRunning('meeting-hot'), true);
+    assert.ok(getRun('meeting-hot'), '正在跑的会议必须还在');
   });
 });

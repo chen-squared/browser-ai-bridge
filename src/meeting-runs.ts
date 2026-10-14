@@ -41,11 +41,15 @@ const runs = new Map<string, MeetingRun>();
 
 function evictOldest(): void {
   while (runs.size > MAX_TRACKED_RUNS) {
-    const oldest = [...runs.entries()].sort((a, b) => a[1].startedAt - b[1].startedAt)[0];
-    if (!oldest) {
+    // 正在跑的绝不能挤掉：挤掉它进度就凭空消失，页面轮询直接 404。
+    // 先挤已结束里最老的；要是全在跑，就不动（多占几条比丢进度强）。
+    const finished = [...runs.entries()]
+      .filter(([, run]) => run.status !== 'running')
+      .sort((a, b) => a[1].startedAt - b[1].startedAt)[0];
+    if (!finished) {
       return;
     }
-    runs.delete(oldest[0]);
+    runs.delete(finished[0]);
   }
 }
 
@@ -108,13 +112,14 @@ export function appendRunDelta(
   provider: string,
   round: number,
   contentDelta: string,
+  stage: MeetingTranscriptEntry['stage'] = 'discussion',
 ): boolean {
   const run = runs.get(meetingId);
   if (!run || run.status !== 'running') {
     return false;
   }
   const existing = run.entries.find(
-    (entry) => entry.speaker === speaker && entry.round === round && entry.stage === 'discussion',
+    (entry) => entry.speaker === speaker && entry.round === round && entry.stage === stage,
   );
   if (existing) {
     existing.content = (existing.content || '') + contentDelta;
@@ -125,7 +130,7 @@ export function appendRunDelta(
     role: 'assistant',
     speaker,
     provider: provider as MeetingTranscriptEntry['provider'],
-    stage: 'discussion',
+    stage,
     round,
     content: contentDelta,
   } as MeetingTranscriptEntry);

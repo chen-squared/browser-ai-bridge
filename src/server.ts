@@ -451,16 +451,27 @@ if (corsOrigin) {
 //    页面本体放行，否则没带 token 打开链接只会看到一段 401 的 JSON，而不是页面
 //    上那句"需要令牌"的提示——页面自己会在发请求前检查并给出可点的入口。
 //    注意这只放行**静态页面**，任何带数据的接口仍然要 token。
+//    /meeting/runs* 是 JSON 进度接口，不在此列。
 if (appConfig.bridgeToken) {
   const isPublicPath = (pathname: string) =>
     pathname === '/health' ||
     pathname === '/' ||
     pathname === '/meeting' ||
-    pathname.startsWith('/meeting/') ||
     pathname.startsWith('/vendor/');
+  // 会议页 HTML 本体公开，但它的子路由里混着 JSON 接口：/meeting/runs* 必须走 token。
+  // 之前 startsWith('/meeting/') 一刀切全放行，任何人不用 token 就能窥探会议进度。
+  const isPublicMeetingPage = (pathname: string): boolean => {
+    if (!pathname.startsWith('/meeting/')) {
+      return false;
+    }
+    if (pathname === '/meeting/runs' || pathname.startsWith('/meeting/runs/')) {
+      return false;
+    }
+    return true;
+  };
 
   app.use((req, res, next) => {
-    if (isPublicPath(req.path)) {
+    if (isPublicPath(req.path) || isPublicMeetingPage(req.path)) {
       next();
       return;
     }
@@ -494,12 +505,28 @@ function parseOptionalConversationId(value: unknown): string | undefined {
 }
 
 function writeSse(res: express.Response, data: unknown): void {
-  res.write(`data: ${JSON.stringify(data)}\n\n`);
+  // 客户端（关页面、断网、手机息屏）断开后 res.write 会抛，绝不能让它把整场
+  // runMeetingCompletion 一起带走：调用方只管发，写不进去就静默丢掉。
+  if (res.writableEnded || res.closed) {
+    return;
+  }
+  try {
+    res.write(`data: ${JSON.stringify(data)}\n\n`);
+  } catch {
+    // 断流时静默丢掉，会议本身在服务端照跑，回来用 GET /meeting/runs/:id 取。
+  }
 }
 
 function finishSse(res: express.Response): void {
-  res.write('data: [DONE]\n\n');
-  res.end();
+  if (res.writableEnded || res.closed) {
+    return;
+  }
+  try {
+    res.write('data: [DONE]\n\n');
+    res.end();
+  } catch {
+    // 同上：收尾写不进去就算了。
+  }
 }
 
 function resolveRequestProvider(payload: Partial<CompletionPayload>): ProviderId | undefined {
@@ -956,6 +983,20 @@ app.patch('/meetings/:id', async (req, res) => {
     res.status(400).json({ error: { message: body.error.issues[0]?.message ?? '参数不合法' } });
     return;
   }
+  // 跑着的时候别动编排：本轮席位快照已经发出去了，现在改 participants/rounds，
+  // 下一轮别名错位，summarizerSeat 可能下轮才报 400。标题随便改。
+  const touchesPlan =
+    body.data.mode !== undefined ||
+    body.data.participants !== undefined ||
+    body.data.summarizer !== undefined ||
+    body.data.summarizerSeat !== undefined ||
+    body.data.rounds !== undefined;
+  if (touchesPlan && isRunning(req.params.id)) {
+    res
+      .status(409)
+      .json({ error: { message: '这场会议还在跑，等它跑完再改编排（标题可以改）。' } });
+    return;
+  }
   const store = await meetingStore();
   const record = store.update(req.params.id, body.data);
   if (!record) {
@@ -971,6 +1012,9 @@ app.delete('/meetings/:id', async (req, res) => {
     res.status(404).json({ error: { message: `找不到会议: ${req.params.id}` } });
     return;
   }
+  // 正在跑的也一起停掉：否则运行状态永远卡在 running，这个 id 再也跑不起来
+  // （每次 POST 都 409），listRunningRuns 里还挂着一条幽灵。
+  clearRun(req.params.id);
   res.json({ ok: true });
 });
 
@@ -1044,12 +1088,15 @@ app.post('/v1/chat/completions', async (req, res) => {
               } else if (event.type === 'meeting.delta' && event.contentDelta) {
                 // 增量也记进运行状态：用户中途关掉页面，回来时至少能看到
                 // 已经写出来的那一半，而不是一片空白。
+                // 总结那轮 round 为 0，stage 必须记成 summary，否则它会污染成
+                // 一条 discussion，之后真正的 summary entry 落下来时两者并存。
                 appendRunDelta(
                   record.id,
                   event.speaker,
                   event.provider,
                   event.round,
                   event.contentDelta,
+                  event.round === 0 ? 'summary' : 'discussion',
                 );
               }
               writeSse(res, event);

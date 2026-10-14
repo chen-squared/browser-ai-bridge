@@ -478,6 +478,25 @@ export async function runMeetingCompletion(
     priorTranscript?: MeetingTranscriptEntry[];
   },
 ) {
+  /**
+   * 发进度，但不等、不抛。
+   *
+   * 进度是"尽力而为"的旁路：客户端断开后靠轮询也能对上，所以这里绝不能 await
+   * （delta 是热路径，串行等会拖慢流速），也不能裸 void（回调一旦 reject 就是
+   * unhandled rejection，半夜能把整个进程带走）。吞掉异常，只留一条 warn。
+   */
+  const fireProgress = (event: MeetingProgressEvent): void => {
+    try {
+      const result = options?.onProgress?.(event);
+      if (result && typeof (result as Promise<void>).catch === 'function') {
+        (result as Promise<void>).catch((error: unknown) => {
+          console.warn(`[meeting] 进度回调失败（已忽略）: ${String(error).slice(0, 120)}`);
+        });
+      }
+    } catch (error) {
+      console.warn(`[meeting] 进度回调抛错（已忽略）: ${String(error).slice(0, 120)}`);
+    }
+  };
   const plan = resolveMeetingPlan(template, payload);
   const policy = buildMeetingPolicy(plan);
   const seedMessages = payload.messages.map((message) => ({ ...message }));
@@ -527,7 +546,7 @@ export async function runMeetingCompletion(
     });
 
     // 先报"他开始写了"，页面上对应的气泡立刻出现，不用等第一段文字。
-    void options?.onProgress?.({
+    fireProgress({
       type: 'meeting.speaking',
       meeting: { conversationId: effectiveConversationId, template: plan.id },
       speaker: participant.alias,
@@ -554,7 +573,7 @@ export async function runMeetingCompletion(
       },
       {
         onDelta: (delta) => {
-          void options?.onProgress?.({
+          fireProgress({
             type: 'meeting.delta',
             meeting: { conversationId: effectiveConversationId, template: plan.id },
             speaker: participant.alias,
@@ -709,7 +728,7 @@ export async function runMeetingCompletion(
     },
   );
 
-  void options?.onProgress?.({
+  fireProgress({
     type: 'meeting.speaking',
     meeting: { conversationId: effectiveConversationId, template: plan.id },
     speaker: plan.summarizer.alias,
@@ -740,7 +759,7 @@ export async function runMeetingCompletion(
       {
         // 总结同样是逐字推，用户不用对着空白等它写完。
         onDelta: (delta) => {
-          void options?.onProgress?.({
+          fireProgress({
             type: 'meeting.delta',
             meeting: { conversationId: effectiveConversationId, template: plan.id },
             speaker: plan.summarizer.alias,
@@ -768,6 +787,7 @@ export async function runMeetingCompletion(
     speaker: plan.summarizer.alias,
     provider: plan.summarizer.provider,
     stage: 'summary',
+    round: 0,
     content: summaryResult.content || '',
   });
   // 总结也要发 meeting.entry。原先只 push 进 transcript，靠末尾补发的 OpenAI 形状
