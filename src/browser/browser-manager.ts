@@ -631,17 +631,23 @@ export class BrowserManager {
       // SSE 只在快照没抓到时顶上。
       for (const item of [...matched].reverse()) {
         const reduced = reduceClaudeConversation(item.text);
+        if (reduced?.error) {
+          return reduced;
+        }
         if (reduced && (reduced.content || reduced.reasoningContent)) {
           return reduced;
         }
       }
       for (const item of [...matched].reverse()) {
         const streamed = reduceClaudeStream(parseSseEvents(item.text).map((event) => event.data));
+        if (streamed?.error) {
+          return streamed;
+        }
         if (streamed && (streamed.content || streamed.reasoningContent)) {
           return streamed;
         }
       }
-      return undefined;
+      return this.streamErrorFallback(providerId, matched);
     }
 
     if (reducer === 'gemini') {
@@ -649,11 +655,17 @@ export class BrowserManager {
       // 从后往前找——最后一帧就是完整答案。
       for (const item of [...matched].reverse()) {
         const reduced = reduceGeminiStream(item.text);
+        // 配额用完时站点不给正文只给错误码，归约结果是 {error} 而不是内容。
+        // 必须在这里直接返回，否则它会被当成"空内容"跳过，最后报一句含糊的
+        // "未能稳定提取"（之前三家分支都有这个漏洞，只有 grok 那条处理了）。
+        if (reduced?.error) {
+          return reduced;
+        }
         if (reduced?.content) {
           return reduced;
         }
       }
-      return undefined;
+      return this.streamErrorFallback(providerId, matched);
     }
 
     if (reducer === 'chatgpt') {
@@ -665,6 +677,9 @@ export class BrowserManager {
       let partial: ReducedStream | undefined;
       for (const item of matched) {
         const reduced = reduceChatgptStream(parseSseEvents(item.text).map((e) => e.data));
+        if (reduced?.error) {
+          return reduced;
+        }
         if (!reduced || !(reduced.content || reduced.reasoningContent)) {
           continue;
         }
@@ -673,7 +688,7 @@ export class BrowserManager {
         }
         partial ??= reduced;
       }
-      return partial;
+      return partial ?? this.streamErrorFallback(providerId, matched);
     }
 
     const reducers: Record<'qwen' | 'deepseek', typeof reduceQwenStream> = {
@@ -684,11 +699,28 @@ export class BrowserManager {
 
     for (const item of matched) {
       const reduced = reduce(parseSseFrames(item.text));
+      if (reduced?.error) {
+        return reduced;
+      }
       if (reduced && (reduced.content || reduced.reasoningContent)) {
         return reduced;
       }
     }
 
+    return this.streamErrorFallback(providerId, matched);
+  }
+
+  /**
+   * 归约不出内容时，先问问站点自己是不是报错了，再认输。
+   *
+   * 配额用完时站点**不给正文**只给错误事件。原来只有 grok 分支和最下面的
+   * qwen/deepseek 兜底走了这一问，claude/gemini/chatgpt 三家一律返回 undefined，
+   * 错误一路退化成"未能稳定提取 XXX 的回复内容"，真正的原因被吞掉了。
+   */
+  private streamErrorFallback(
+    providerId: ProviderId,
+    matched: CapturedStream[],
+  ): ReducedStream | undefined {
     const failure = detectProviderStreamError(providerId, matched.map((m) => m.text).join('\n'));
     return failure
       ? { content: '', reasoningContent: '', finished: false, error: failure.message }
@@ -714,6 +746,11 @@ export class BrowserManager {
     const frames = this.capturedFrames.get(page) ?? [];
     let cursor = since;
     for (;;) {
+      // 调用方放弃后生成器还会在这里无限 setTimeout 轮询：页面关了就停，
+      // 否则越积越多把事件循环拖死。
+      if (page.isClosed()) {
+        return;
+      }
       const fresh = frames.filter((item) => item.capturedAt >= cursor);
       if (fresh.length > 0) {
         cursor = (fresh[fresh.length - 1]?.capturedAt ?? cursor) + 1;

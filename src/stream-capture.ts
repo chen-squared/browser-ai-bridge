@@ -591,7 +591,12 @@ export function reduceGrokStream(frames: readonly string[]): ReducedStream | und
 
     if (type === 'response.done') {
       const response = event['response'] as { status?: string } | undefined;
-      finished = response?.status === 'completed' || finished;
+      // completed 之外还有 failed / cancelled 这类终态。原来只认 completed，
+      // 失败时 finished 永远是 false，调用方干等整个窗口才超时——明明站点第一秒
+      // 就说完了。事件名就叫 response.done，带状态即终局。
+      if (typeof response?.status === 'string') {
+        finished = true;
+      }
       continue;
     }
 
@@ -683,7 +688,9 @@ export function createGrokAccumulator(): {
       }
       if (type === 'response.done') {
         const response = event['response'] as { status?: string } | undefined;
-        if (response?.status === 'completed') {
+        // 与 reduceGrokStream 同理：带状态的 response.done 即终局，
+        // 不只认 completed，否则失败时直播永远等不到 finished。
+        if (typeof response?.status === 'string') {
           finished = true;
         }
         return finished ? { finished: true } : {};
@@ -716,9 +723,11 @@ export function createGrokAccumulator(): {
       if (content.length > before.contentLength) {
         delta.contentDelta = content.slice(before.contentLength);
       }
-      // 思考是"按行追加"的，一帧就是一行，所以这一帧新增的思考就是最后一行。
-      if (reasoningLines.length > before.reasoningLineCount && reasoningLines.at(-1)) {
-        delta.reasoningDelta = reasoningLines.at(-1);
+      // 思考是"按行追加"的，单帧可能含多行——新增的是这一段区间的每一行，
+      // 不只是最后一行。原来只取最后一行，单帧多行时中间的在直播里直接丢了
+      // （快照是对的，所以事后看结果没问题，只有直播过程会跳字）。
+      if (reasoningLines.length > before.reasoningLineCount) {
+        delta.reasoningDelta = reasoningLines.slice(before.reasoningLineCount).join('\n');
       }
       return delta;
     },
@@ -1517,21 +1526,21 @@ export function reduceGeminiStream(body: string): ReducedStream | undefined {
         continue;
       }
       // ["di", n] 是耗时统计；["e", n, ...] 是结束标记，都不是 wrb.fr
-      if (row[0] === 'e') {
-        continue;
-      }
+      // 但错误行恰恰长这样：["e", ..., "BardErrorInfo…"]。所以先看错误再跳过，
+      // 否则配额用完会被当成"空内容"吞掉，最后报一句含糊的"未能稳定提取"。
       const innerRaw = row[2];
-      if (typeof innerRaw !== 'string') {
-        continue;
-      }
-      sawFrame = true;
-
-      // 配额/风控等错误也走这里：BardErrorInfo 会被塞进同一层
-      if (innerRaw.includes('BardErrorInfo')) {
+      if (typeof innerRaw === 'string' && innerRaw.includes('BardErrorInfo')) {
         const code = /BardErrorInfo",\s*\[(\d+)\]/.exec(innerRaw);
         sawError = `Gemini 返回错误码 ${code ? code[1] : '未知'}（配额、风控或网络）`;
         continue;
       }
+      if (row[0] === 'e') {
+        continue;
+      }
+      if (typeof innerRaw !== 'string') {
+        continue;
+      }
+      sawFrame = true;
 
       let inner: unknown;
       try {
@@ -1546,13 +1555,16 @@ export function reduceGeminiStream(body: string): ReducedStream | undefined {
     }
   }
 
-  if (!sawFrame) {
+  if (!sawFrame && !sawError) {
     return undefined;
   }
 
   if (!best?.text) {
+    // 和其它 reducer 一样用 {error} 对象返回，不抛异常：
+    // 调用方（takeCapturedStream / awaitCapturedStream）认的是 .error 字段，
+    // 抛出去反而要看每一层有没有接住，漏一层就变成含糊的失败。
     if (sawError) {
-      throw new Error(sawError);
+      return { content: '', reasoningContent: '', finished: true, error: sawError };
     }
     return undefined;
   }

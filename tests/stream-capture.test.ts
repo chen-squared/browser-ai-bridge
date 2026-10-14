@@ -353,6 +353,27 @@ test('reduceGrokStream reports unfinished without response.done', () => {
   assert.equal(reduced?.finished, false);
 });
 
+test('reduceGrokStream treats failed/cancelled as finished, not a reason to wait', () => {
+  // 之前只认 completed：失败时 finished 永远 false，调用方干等整个窗口才超时。
+  for (const status of ['failed', 'cancelled', 'incomplete']) {
+    const reduced = reduceGrokStream([
+      '{"event":{"type":"response.chunk","chunk":{"text":{"text":"半句","channel":"CHANNEL_ASSISTANT_RESPONSE"}}}}',
+      `{"event":{"type":"response.done","response":{"status":"${status}"}}}`,
+    ]);
+    assert.equal(reduced?.finished, true, status);
+    assert.equal(reduced?.content, '半句', '已有正文要保留');
+  }
+});
+
+test('live accumulator also finishes on failed/cancelled', () => {
+  const accumulator = createGrokAccumulator();
+  const delta = accumulator.push(
+    '{"event":{"type":"response.done","response":{"status":"failed"}}}',
+  );
+  assert.equal(delta.finished, true);
+  assert.equal(accumulator.snapshot().finished, true);
+});
+
 test('reduceGrokStream splits multi-line reasoning frames into separate lines', () => {
   // 实测：Grok 的思考通道单帧可能带换行。整帧 push 会让 join('\n') 多出一层空行。
   const frames = [
@@ -371,6 +392,16 @@ test('reduceGrokStream splits multi-line reasoning in the live accumulator too',
   );
   const snapshot = accumulator.snapshot();
   assert.equal(snapshot.reasoningContent, '甲\n乙');
+});
+
+test('live accumulator reports every new reasoning line, not just the last', () => {
+  // 之前只取最后一行：单帧多行时中间的在直播里直接丢了（快照是对的，
+  // 所以事后看结果没问题，只有直播过程会跳字）。
+  const accumulator = createGrokAccumulator();
+  const delta = accumulator.push(
+    '{"event":{"type":"response.chunk","chunk":{"text":{"text":"甲\\n乙\\n丙","channel":"CHANNEL_ASSISTANT_NOTETAKER_HEADER"}}}}',
+  );
+  assert.equal(delta.reasoningDelta, '甲\n乙\n丙');
 });
 
 test('reduceGrokStream returns undefined when there is nothing parseable', () => {
@@ -866,7 +897,7 @@ describe('Gemini —— Google 私有 batchexecute 封装', () => {
     assert.equal(reduceGeminiStream('data: {"a":1}'), undefined);
   });
 
-  it('配额错误会抛出可读的错误，而不是静默返回空', () => {
+  it('配额错误返回 {error} 而不是抛异常或静默返回空', () => {
     // 实测配额耗尽时回的是 BardErrorInfo [1099]。这里手工造一个最小的等价帧，
     // 长度前缀这里可以不给——切帧实际靠方括号配平。
     const inner = JSON.stringify([
@@ -875,7 +906,24 @@ describe('Gemini —— Google 私有 batchexecute 封装', () => {
       { 1: ['type.googleapis.com/assistant.boq.bard.application.BardErrorInfo', [1099]] },
     ]);
     const frame = JSON.stringify([['wrb.fr', null, inner]]);
-    assert.throws(() => reduceGeminiStream(`)]}'\n\n${frame}`), /1099|配额/);
+    const reduced = reduceGeminiStream(`)]}'\n\n${frame}`);
+    assert.ok(reduced?.error, '应该带上错误而不是 undefined');
+    assert.match(reduced!.error!, /1099|配额/);
+    // 调用方认的是 .error 字段：抛出去反而要看每一层有没有接住。
+    assert.equal(reduced!.content, '');
+  });
+
+  it('错误行即使伪装成结束标记 ["e",…] 也要认出来', () => {
+    // 之前先按 row[0]==='e' 跳过再查 BardErrorInfo，错误行的配额信息直接被丢掉。
+    const inner = JSON.stringify([
+      null,
+      ['c_1', 'r_1'],
+      { 1: ['type.googleapis.com/assistant.boq.bard.application.BardErrorInfo', [1100]] },
+    ]);
+    const frame = JSON.stringify([['e', 1, inner]]);
+    const reduced = reduceGeminiStream(`)]}'\n\n${frame}`);
+    assert.ok(reduced?.error, '结束标记里的错误码也不能漏');
+    assert.match(reduced!.error!, /1100|错误码/);
   });
 });
 
