@@ -1144,6 +1144,7 @@ export class ProviderClient {
     let pushed = '';
     let sawContent = false;
     let grewAt = 0;
+    let best: ReducedStream | undefined;
 
     for (;;) {
       const captured = this.streamSource?.take(page, since);
@@ -1165,6 +1166,7 @@ export class ProviderClient {
               preview: captured.content.slice(0, 180),
             });
           }
+          best = captured;
         }
       }
 
@@ -1172,14 +1174,16 @@ export class ProviderClient {
       // Gemini / Claude 的归约器是无条件 finished:true 的（"取最后一份完整快照"），
       // 增量下推时第一份能解析出字的中间快照就会触发它，于是刚出两个字就收工。
       if (captured?.content && this.streamSource?.settled?.(page, since)) {
-        return captured;
+        // 返回见过的最长的那份，不是当前这一轮 take 到的：同一轮可能有多条流
+        // （重试、续传），新冒出来的那条可能更短，直接返回它就把答案截断了。
+        return best ?? captured;
       }
 
       const elapsed = Date.now() - startedAt;
       // 出过字之后长时间不再增长就收工。ChatGPT 的 SSE **永远等不到 eof**
       // （实测读完 body 也拿不到 finished），干等下去只会把整条回答的延迟全部吐掉。
       if (sawContent && grewAt > 0 && Date.now() - grewAt > 3_000) {
-        return captured;
+        return best ?? captured;
       }
       // 一个字都没有时不自己下判断——赛跑里还有 DOM 那一路，让它去比。
       // 只保留一个兜底上限，免得 hook 压根没装上时永远挂着。
@@ -1187,7 +1191,7 @@ export class ProviderClient {
         return undefined;
       }
       if (elapsed > (provider.maxGenerationTimeoutMs ?? 600_000)) {
-        return sawContent ? captured : undefined;
+        return sawContent ? (best ?? captured) : undefined;
       }
 
       await page.waitForTimeout(120);
@@ -1273,13 +1277,17 @@ export class ProviderClient {
         return captured;
       }
       if (captured?.content) {
-        last = captured;
+        // 只记住最长的那份：同一轮可能有多条流，新冒出来的那条可能更短，
+        // 直接覆盖就会把之前攒的长的丢掉（实测撞到过只返回 20 字的"成功"）。
+        if (!last || captured.content.length > (last.content?.length ?? 0)) {
+          last = captured;
+        }
         // **拿到内容不等于拿到完整内容。** HTTP 的 body 只有响应结束后才完整，
         // 而在此之前可能已经读到一部分——实测 ChatGPT 会在半途就 resolve，
         // 于是正文只剩「皑」这种半个字。
         // 所以必须等到站点自己说"这一轮结束了"（finished），或者超时。
         if (captured.finished) {
-          return captured;
+          return last;
         }
       }
       if (Date.now() - startedAt >= timeoutMs) {
@@ -1828,6 +1836,10 @@ export class ProviderClient {
    * 之类的属性判断容易误伤，这时宁可放行给后面的发送逻辑去处理。
    */
   private async isSendReady(page: Page, provider: ProviderConfig): Promise<boolean> {
+    // 没配选择器时无从判断，放行给后面的发送逻辑处理。
+    if (!provider.sendButtonSelectors.length) {
+      return true;
+    }
     for (const selector of provider.sendButtonSelectors) {
       const button = await this.findVisibleCandidate(page.locator(selector));
       if (!button) {
@@ -1837,11 +1849,15 @@ export class ProviderClient {
         if (await button.isEnabled()) {
           return true;
         }
+        // 禁用：继续看下一个候选，不要直接判死。
       } catch {
-        return true;
+        // 句柄失效等瞬时问题：跳过这个候选，而不是当成就绪。
+        continue;
       }
     }
-    return true;
+    // 一个可见按钮都没找到，或全是禁用：说明 App 还没吃到输入，直接说没就绪。
+    // 调用方（fillContentEditable）会因此改走键盘逐字输入那条更可靠的路。
+    return false;
   }
 
   /**
@@ -1861,7 +1877,9 @@ export class ProviderClient {
     prompt: string,
     attempt: number,
   ): Promise<void> {
-    const tail = prompt.trim().slice(-16);
+    // 首尾都归一化后再取尾：提示词里可能有换行（总结那种中继提示词是多行的），
+    // 输入框读回时空白会被压成空格，不归一化就永远对不上。
+    const tail = prompt.trim().replace(/\s+/g, ' ').slice(-16);
     if (tail.length < 4) {
       return;
     }
@@ -1869,16 +1887,20 @@ export class ProviderClient {
     if (current.includes(tail)) {
       return;
     }
-    // 贴到屏幕上了就算了，别为了凑验证把提示词重复一遍。
+    // 输入框里没有，页面上别处（用户气泡）有也算——别为了凑验证把提示词重复一遍。
+    // 两边都试：气泡原文可能保留换行，归一化过的也可能 already 在页面上。
+    const rawTail = prompt.trim().slice(-16);
     const onPage = await page
       .locator('body')
       .innerText({ timeout: 2000 })
-      .then((text) => text.includes(tail))
+      .then((text) => text.includes(rawTail) || text.includes(tail))
       .catch(() => false);
     if (onPage) {
       return;
     }
-    throw new Error(`第 ${attempt + 1} 次填充后输入框里没有提示词（读到 ${current}）`);
+    throw new Error(
+      `第 ${attempt + 1} 次填充后输入框里没有提示词（读到 ${JSON.stringify(current.slice(0, 80))}）`,
+    );
   }
 
   private async fillTextInput(
@@ -2343,7 +2365,7 @@ export class ProviderClient {
         continue;
       }
 
-      // 字还在输入框里跑了两轮都没动静：确定没发出去。
+      // 字还在输入框里：超过半程还没动静，确定没发出去。
       if (Date.now() - startedAt > timeoutMs / 2) {
         return 'not-sent';
       }
@@ -2351,6 +2373,13 @@ export class ProviderClient {
       await page.waitForTimeout(150);
     }
 
+    // 超时了再看一眼输入框，分清两种情况：
+    // - 字还在里面 = 真的没发出去（not-sent），调用方重试是安全的；
+    // - 框已经空了但回显对不上 = 说不清（unknown），绝不能按 not-sent 重试，
+    //   否则已发出去的消息会被再发一遍。
+    if (await this.isInputCleared(page, provider.inputSelectors).catch(() => false)) {
+      return 'unknown';
+    }
     return 'not-sent';
   }
 
@@ -2375,14 +2404,16 @@ export class ProviderClient {
     provider: ProviderConfig,
     latestUserMessage: string,
   ): Promise<boolean> {
-    const tail = latestUserMessage.trim().slice(-24);
-    if (tail.length < 4) {
+    const rawTail = latestUserMessage.trim().slice(-24);
+    // 输入框读回时空白会被压成空格，原始尾和归一化尾都认——多行提示词两边都能对上。
+    const tail = latestUserMessage.trim().replace(/\s+/g, ' ').slice(-24);
+    if (rawTail.length < 4) {
       // 提示词太短时不敢拿它当证据，退回"只要输入框空了就算"。
       return true;
     }
     try {
       const text = await page.locator('body').innerText({ timeout: 3000 });
-      if (!text.includes(tail)) {
+      if (!text.includes(rawTail) && !text.includes(tail)) {
         return false;
       }
       // 字还留在输入框里就不算——那是我们刚自己填进去的。
@@ -2659,7 +2690,13 @@ export class ProviderClient {
       await line('抓到的候选文本数', async () =>
         String(await this.countCandidateTexts(page, provider)),
       ),
-      await line('输入框内容', () => this.readComposerText(page, provider)),
+      await line('输入框内容', async () => {
+        const text = await this.readComposerText(page, provider);
+        // 展示截断：完整原文已经给验证用过了，报错信息里留 80 字就够定位。
+        return text === '(空)'
+          ? text
+          : JSON.stringify(`${text.slice(0, 80)}${text.length > 80 ? '…' : ''}`);
+      }),
       await line('页面上的提示', () => this.readVisibleNotices(page)),
       await line('是否转圈', async () => ((await this.isBusy(page, provider)) ? '是' : '否')),
     ].join('\n');
@@ -2680,7 +2717,10 @@ export class ProviderClient {
       });
       const trimmed = (text || '').trim().replace(/\s+/g, ' ');
       if (trimmed) {
-        return JSON.stringify(trimmed.slice(0, 80));
+        // 返回完整原文：调用方里有拿它做包含判断的（assertComposerHasText、
+        // isPromptEchoVisible），截断过的只能用来展示，不能用来验证。
+        // 之前这里 slice(0, 80)，长提示词的尾部永远对不上，填充验证必失败。
+        return trimmed;
       }
     }
     return '(空)';
