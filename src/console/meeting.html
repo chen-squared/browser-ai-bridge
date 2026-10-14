@@ -1451,6 +1451,8 @@
       }
 
       async function openMeeting(id) {
+        // 用户切到别的会议：旧的发送流和轮询都自行退出，别再往新时间线里写。
+        liveSendToken += 1;
         try {
           const { meeting } = await api('/meetings/' + id);
           state.meetingId = meeting.id;
@@ -1502,9 +1504,18 @@
        * 甚至关掉页面，会议照跑；回来时靠这个轮询把进度和最终结果取回来。
        */
       let runTimer = null;
+      // 轮询代次：切会、重连、停看时加一，旧循环在下一个 await 后自行退出。
+      // 之前只靠 state.meetingId 比对，而比对点在 3 秒 sleep 之后——切会发生在
+      // fetch 途中时，旧会议的气泡照样写进新时间线；stopWatchingRun 清的 runTimer
+      // 又恒为 null，等于没有取消。
+      let watchToken = 0;
+      // 发送流代次：切会 / 新建会议时加一，正在读旧流的 send 循环自行断流退出。
+      // 服务端会议照跑（回来用轮询接上），只是不再往已经切走的页面里写气泡。
+      let liveSendToken = 0;
       async function attachToRun(meetingId) {
-        stopWatchingRun();
-        let seen = 0;
+        const mine = ++watchToken;
+        stopWatchingRunTimerOnly();
+        const column = $('transcript');
         for (;;) {
           let run;
           try {
@@ -1512,17 +1523,35 @@
           } catch {
             return; // 没在跑（或已经跑完落库了），不必再盯
           }
+          // fetch 途中用户切走了：这份数据已经不属于当前页面，直接丢掉。
+          if (mine !== watchToken || state.meetingId !== meetingId) {
+            return;
+          }
           if (!run || run.status !== 'running') {
             return;
           }
 
-          for (const entry of run.entries.slice(seen)) {
-            const column = $('transcript');
-            if (!column.querySelector(`[data-run-key="${CSS.escape(runKey(entry))}"]`)) {
-              column.append(bubbleFor(entry));
+          // 按"人+阶段+轮"对账，而不是按条数 slice：
+          // 服务端增量是攒进同一条的（半截先到、完整后来替换），条数根本不变，
+          // 按条数取永远看不到完整版；按内容前 24 字认还会把半截和完整认成同一条。
+          // 这里有就地更新、没有才追加。
+          for (const entry of run.entries) {
+            const key = `${entry.speaker}|${entry.stage}|${entry.round ?? 0}`;
+            const existing = column.querySelector(`[data-collapse-key="${CSS.escape(key)}"]`);
+            // 内容没变就不碰 DOM：每 3 秒全量替换会打断用户正在选中的文字。
+            const fingerprint = `${(entry.content || '').length}:${(entry.content || '').slice(-32)}`;
+            if (existing) {
+              if (existing.dataset.fingerprint !== fingerprint) {
+                const fresh = bubbleFor(entry);
+                fresh.dataset.fingerprint = fingerprint;
+                existing.replaceWith(fresh);
+              }
+            } else {
+              const node = bubbleFor(entry);
+              node.dataset.fingerprint = fingerprint;
+              column.append(node);
             }
           }
-          seen = run.entries.length;
           $('welcome').hidden = true;
           // 谁正在写也要还原出来，否则回来只看到几条已完成的，
           // 分不清"还没开始"和"有人正卡在生成上"。
@@ -1549,25 +1578,26 @@
           );
 
           await new Promise((resolve) => setTimeout(resolve, 3000));
-          // 用户中途又切到别的会议就别再盯了
-          if (state.meetingId !== meetingId) {
+          // sleep 途中切走 / 停看：代次已经变了，直接退出，不再发下一轮请求。
+          if (mine !== watchToken || state.meetingId !== meetingId) {
             return;
           }
         }
       }
 
-      function runKey(entry) {
-        return `${entry.speaker}-${entry.stage}-${entry.round ?? 0}-${(entry.content || '').slice(
-          0,
-          24,
-        )}`;
-      }
-
-      function stopWatchingRun() {
+      function stopWatchingRunTimerOnly() {
         if (runTimer) {
           clearTimeout(runTimer);
           runTimer = null;
         }
+      }
+
+      function stopWatchingRun() {
+        // 加代次，正在进行的循环在下一个 await 后自行退出。
+        watchToken += 1;
+        // 顺带让正在读流的 send 也停下来（resetToNew 会调到这里）。
+        liveSendToken += 1;
+        stopWatchingRunTimerOnly();
       }
 
       /** 这场会议库里有没有真的记下轮次。没有就别重画，否则会把现场擦成空白。 */
@@ -1777,8 +1807,21 @@
           const reader = response.body.getReader();
           const decoder = new TextDecoder();
           let buffer = '';
+          // 切会后不再往页面写东西：finally 里那套"重画时间线"也一起跳过，
+          // 否则会把新会议的现场擦掉重画成旧的。
+          let aborted = false;
+          const sendMine = liveSendToken;
           for (;;) {
             const chunk = await reader.read();
+            if (sendMine !== liveSendToken) {
+              aborted = true;
+              try {
+                await reader.cancel();
+              } catch {
+                /* 断流本身不需要再报 */
+              }
+              return;
+            }
             buffer += chunk.done ? decoder.decode() : decoder.decode(chunk.value, { stream: true });
             let cut;
             while ((cut = buffer.indexOf('\n\n')) !== -1) {
@@ -1866,7 +1909,10 @@
           state.busy = false;
           state.turnWrap = null;
           $('sendBtn').disabled = $('input').value.trim() === '';
-          // 只有当库里真的记下了这一轮才重新渲染。
+          if (aborted) {
+            // 切会后直接收工：下面的重画属于旧会议，会擦掉新会议的现场。
+            return;
+          }
           //
           // 中途出错时这一轮是空的，原来这里无条件 openMeeting，而 openMeeting
           // 会 `column.innerHTML = ''` 再按记录重画 —— 于是屏幕上刚才还能看到的

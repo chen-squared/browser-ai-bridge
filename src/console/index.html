@@ -1178,11 +1178,16 @@
          否则一个代理对（emoji、罕用汉字）会被劈成两半，
          拼出来的文本里会出现替换字符。
       ─────────────────────────────────────────────────────── */
-      async function readEventStream(url, payload, onDelta) {
+      async function readEventStream(url, payload, onDelta, signal) {
+        // 调用前就停了就别发请求了——错峰启动时后排任务排到它时用户可能已经按了停止。
+        if (signal) {
+          signal.throwIfAborted();
+        }
         const response = await fetch(url, {
           method: 'POST',
           headers: withToken({ 'Content-Type': 'application/json' }),
           body: JSON.stringify(payload),
+          ...(signal ? { signal } : {}),
         });
 
         if (!response.ok) {
@@ -1207,6 +1212,10 @@
 
         for (;;) {
           const chunk = await reader.read();
+          // 读到一半按了停止：别再把后面的增量往卡片上写了。
+          if (signal) {
+            signal.throwIfAborted();
+          }
           if (chunk.done) {
             buffer += decoder.decode();
           } else {
@@ -1257,25 +1266,39 @@
          失败后 3 秒就重试而不是干等一个轮询周期。
       ─────────────────────────────────────────────────────── */
       async function refreshHealth() {
-        const badge = $('healthBadge');
-        const text = $('healthText');
+        // 并发守卫：visibilitychange / online / 定时器可能同时触发，
+        // 不拦的话两个请求竞跑，后写的覆盖先写的，红绿来回闪。
+        if (refreshHealth.busy) {
+          return;
+        }
+        refreshHealth.busy = true;
         try {
-          const response = await fetch('/health', {
-            headers: withToken({}),
-            cache: 'no-store',
-          });
-          if (!response.ok) {
+          const badge = $('healthBadge');
+          const text = $('healthText');
+          try {
+            const response = await fetch('/health', {
+              headers: withToken({}),
+              cache: 'no-store',
+            });
+            if (!response.ok) {
+              badge.dataset.state = 'bad';
+              text.textContent = `服务返回 ${response.status}`;
+              return;
+            }
+            const payload = await response.json();
+            badge.dataset.state = payload.ok ? 'ok' : 'bad';
+            text.textContent = payload.headless ? '运行中（无头）' : '运行中';
+          } catch {
+            // fetch 抛错才是真的连不上（服务没起、地址不通、Tailscale 断了）。
             badge.dataset.state = 'bad';
-            text.textContent = `服务返回 ${response.status}`;
-            return;
+            text.textContent = '连不上';
+            // 失败后 3 秒就重试一次，而不是干等 20 秒轮询周期。
+            // 注释里一直这么写，代码里一直没做，这次补上。
+            clearTimeout(refreshHealth.retry);
+            refreshHealth.retry = setTimeout(refreshHealth, 3000);
           }
-          const payload = await response.json();
-          badge.dataset.state = payload.ok ? 'ok' : 'bad';
-          text.textContent = payload.headless ? '运行中（无头）' : '运行中';
-        } catch {
-          // fetch 抛错才是真的连不上（服务没起、地址不通、Tailscale 断了）。
-          badge.dataset.state = 'bad';
-          text.textContent = '连不上';
+        } finally {
+          refreshHealth.busy = false;
         }
       }
 
@@ -1433,7 +1456,24 @@
         const jobs = [];
         for (const [index, id] of picked.entries()) {
           if (index > 0) {
-            await new Promise((resolve) => setTimeout(resolve, PARALLEL_STAGGER_MS));
+            // 错峰等待也要能中断：否则按了停止，后排任务照样一个个启动，
+            // 服务端浏览器跟着全跑起来，停止键等于没按。
+            await new Promise((resolve, reject) => {
+              const timer = setTimeout(resolve, PARALLEL_STAGGER_MS);
+              if (controller.signal.aborted) {
+                clearTimeout(timer);
+                reject(new DOMException('aborted', 'AbortError'));
+              } else {
+                controller.signal.addEventListener('abort', () => {
+                  clearTimeout(timer);
+                  reject(new DOMException('aborted', 'AbortError'));
+                });
+              }
+            }).catch(() => {});
+          }
+          // 等完发现已经停了就别再启动了。
+          if (controller.signal.aborted) {
+            break;
           }
           jobs.push(
             (async () => {
@@ -1514,28 +1554,33 @@
         let thinking = '';
         let conv = null;
 
-        await readEventStream('/v1/chat/completions', payload, (chunk) => {
-          const delta = chunk?.choices?.[0]?.delta || {};
-          if (delta.reasoning_content) {
-            thinking += delta.reasoning_content;
-            entry.thinking.hidden = false;
-            entry.thinkingBody.textContent = thinking;
-          }
-          if (typeof delta.content === 'string' && delta.content) {
-            text += delta.content;
-            // 流式阶段先显示纯文本，等最后拿到完整结果再用 marked 渲染。
-            entry.body.classList.add('caret');
-            entry.body.textContent = text;
-          }
-          if (chunk.conversationId) {
-            conv = chunk.conversationId;
-            saveConv(id, conv);
-            $('conversationId').value = conv;
-          }
-          if (chunk.usage && chunk.usage.total_tokens) {
-            entry.time.textContent = chunk.usage.total_tokens + ' tok';
-          }
-        });
+        await readEventStream(
+          '/v1/chat/completions',
+          payload,
+          (chunk) => {
+            const delta = chunk?.choices?.[0]?.delta || {};
+            if (delta.reasoning_content) {
+              thinking += delta.reasoning_content;
+              entry.thinking.hidden = false;
+              entry.thinkingBody.textContent = thinking;
+            }
+            if (typeof delta.content === 'string' && delta.content) {
+              text += delta.content;
+              // 流式阶段先显示纯文本，等最后拿到完整结果再用 marked 渲染。
+              entry.body.classList.add('caret');
+              entry.body.textContent = text;
+            }
+            if (chunk.conversationId) {
+              conv = chunk.conversationId;
+              saveConv(id, conv);
+              $('conversationId').value = conv;
+            }
+            if (chunk.usage && chunk.usage.total_tokens) {
+              entry.time.textContent = chunk.usage.total_tokens + ' tok';
+            }
+          },
+          signal,
+        );
 
         if (signal && signal.aborted) {
           const err = new Error('aborted');
